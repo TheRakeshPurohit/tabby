@@ -17,10 +17,11 @@ import {
 
 import {
   GitRepositoriesQueryVariables,
-  ListInvitationsQueryVariables
+  ListInvitationsQueryVariables,
+  WebCrawlerUrlsQueryVariables
 } from '../gql/generates/graphql'
 import { refreshTokenMutation } from './auth'
-import { listInvitations, listRepositories } from './query'
+import { listInvitations, listRepositories, listWebCrawlerUrl } from './query'
 import { getAuthToken, isTokenExpired, tokenManager } from './token-management'
 
 interface ValidationError {
@@ -99,7 +100,8 @@ const client = new Client({
       resolvers: {
         Query: {
           invitations: relayPagination(),
-          repositories: relayPagination()
+          gitRepositories: relayPagination(),
+          webCrawlerUrls: relayPagination()
         }
       },
       updates: {
@@ -152,6 +154,30 @@ const client = new Client({
                   )
                 })
             }
+          },
+          deleteWebCrawlerUrl(result, args, cache, info) {
+            if (result.deleteWebCrawlerUrl) {
+              cache
+                .inspectFields('Query')
+                .filter(field => field.fieldName === 'webCrawlerUrls')
+                .forEach(field => {
+                  cache.updateQuery(
+                    {
+                      query: listWebCrawlerUrl,
+                      variables: field.arguments as WebCrawlerUrlsQueryVariables
+                    },
+                    data => {
+                      if (data?.webCrawlerUrls?.edges) {
+                        data.webCrawlerUrls.edges =
+                          data.webCrawlerUrls.edges.filter(
+                            e => e.node.id !== args.id
+                          )
+                      }
+                      return data
+                    }
+                  )
+                })
+            }
           }
         }
       }
@@ -173,9 +199,14 @@ const client = new Client({
           })
         },
         didAuthError(error, _operation) {
-          return error.graphQLErrors.some(
+          const isUnauthorized = error.graphQLErrors.some(
             e => e?.extensions?.code === 'UNAUTHORIZED'
           )
+          if (isUnauthorized) {
+            tokenManager.clearAccessToken()
+          }
+
+          return isUnauthorized
         },
         willAuthError(operation) {
           // Sync tokens on every operation
@@ -231,6 +262,7 @@ const client = new Client({
               return true
             }
           } else {
+            tokenManager.clearAccessToken()
             return true
           }
         },

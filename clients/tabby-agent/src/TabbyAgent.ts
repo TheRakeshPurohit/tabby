@@ -6,7 +6,8 @@ import { getProperty, setProperty, deleteProperty } from "dot-prop";
 import createClient from "openapi-fetch";
 import type { ParseAs } from "openapi-fetch";
 import * as semver from "semver";
-import type { paths as TabbyApi, components as TabbyApiComponents } from "./types/tabbyApi";
+import { Readable } from "readable-stream";
+import type { paths as TabbyApi, components as TabbyApiComponents } from "tabby-openapi/compatible";
 import type {
   Agent,
   AgentStatus,
@@ -31,7 +32,7 @@ import {
   errorToString,
   stringToRegExp,
 } from "./utils";
-import { parseChatResponse } from "./stream";
+import { readChatStream, parseChatResponse } from "./stream";
 import { Auth } from "./Auth";
 import { AgentConfig, PartialAgentConfig, defaultAgentConfig } from "./AgentConfig";
 import { configFile } from "./configFile";
@@ -95,6 +96,7 @@ export class TabbyAgent extends EventEmitter implements Agent {
       this.clientConfig,
       this.serverProvidedConfig,
     ) as AgentConfig;
+    this.config.server.endpoint = this.config.server.endpoint.replace(/\/+$/, ""); // remove trailing slash
     this.logger.trace("Updated config:", this.config);
 
     if (fileLogger) {
@@ -152,7 +154,7 @@ export class TabbyAgent extends EventEmitter implements Agent {
         ? `Bearer ${this.auth.token}`
         : undefined;
     this.api = createClient<TabbyApi>({
-      baseUrl: this.config.server.endpoint.replace(/\/+$/, ""), // remove trailing slash
+      baseUrl: this.config.server.endpoint,
       headers: {
         Authorization: auth,
         ...this.config.server.requestHeaders,
@@ -341,18 +343,36 @@ export class TabbyAgent extends EventEmitter implements Agent {
     } catch (error) {
       if (isUnauthorizedError(error)) {
         this.logger.debug(`Fetch server provided config request failed due to unauthorized. [${requestId}]`);
-      } else if (error! instanceof HttpError) {
+      } else if (!(error instanceof HttpError)) {
         this.logger.error(`Fetch server provided config request failed. [${requestId}]`, error);
       }
     }
   }
 
   public async initialize(options: AgentInitOptions): Promise<boolean> {
-    this.logger.info("Initializing...");
-    this.logger.trace("Initialization options:", options);
+    // initialize loggers
     if (options.loggers) {
       logDestinations.attach(...options.loggers);
     }
+    if (configFile) {
+      await configFile.load();
+      this.userConfig = configFile.config;
+      configFile.on("updated", async (config) => {
+        this.userConfig = config;
+        await this.applyConfig();
+      });
+      configFile.watch();
+    }
+    if (options.config) {
+      this.clientConfig = options.config;
+    }
+    if (fileLogger) {
+      fileLogger.level = this.clientConfig.logs?.level ?? this.userConfig.logs?.level ?? this.config.logs.level;
+    }
+
+    this.logger.info("Initializing...");
+    this.logger.trace("Initialization options:", options);
+
     this.dataStore = options.dataStore ?? defaultDataStore;
     if (this.dataStore) {
       try {
@@ -376,18 +396,6 @@ export class TabbyAgent extends EventEmitter implements Agent {
           this.anonymousUsageLogger.setUserProperties(key, value);
         });
       }
-    }
-    if (configFile) {
-      await configFile.load();
-      this.userConfig = configFile.config;
-      configFile.on("updated", async (config) => {
-        this.userConfig = config;
-        await this.applyConfig();
-      });
-      configFile.watch();
-    }
-    if (options.config) {
-      this.clientConfig = options.config;
     }
     if (this.dataStore) {
       const localConfig = deepmerge(defaultAgentConfig, this.userConfig, this.clientConfig) as AgentConfig;
@@ -790,7 +798,7 @@ export class TabbyAgent extends EventEmitter implements Agent {
     }
 
     // select diffs from the list to generate a prompt under the prompt size limit
-    const { maxDiffLength, promptTemplate, responseMatcher } = this.config.experimentalChat.generateCommitMessage;
+    const { maxDiffLength, promptTemplate, responseMatcher } = this.config.chat.generateCommitMessage;
     let splitDiffs: string[];
     if (typeof diff === "string") {
       splitDiffs = diff.split(/\n(?=diff)/);
@@ -863,5 +871,125 @@ export class TabbyAgent extends EventEmitter implements Agent {
       this.healthCheck(); // schedule a health check
     }
     return "";
+  }
+
+  // selection.start equals selection.end means the cursor position with no selection
+  public async provideChatEdit(
+    document: string,
+    selection: { start: number; end: number },
+    filepath: string,
+    insertMode = false,
+    command: string,
+    languageId = "",
+    options?: AbortSignalOption & { useBetaVersion?: boolean },
+  ): Promise<Readable | null> {
+    if (this.status === "notInitialized") {
+      throw new Error("Agent is not initialized");
+    }
+
+    const documentMaxChars = this.config.chat.edit.documentMaxChars;
+    if (selection.end - selection.start > documentMaxChars) {
+      throw new Error("Document to edit is too long");
+    }
+    if (command.length > this.config.chat.edit.commandMaxChars) {
+      throw new Error("Command is too long");
+    }
+
+    let promptTemplate: string;
+    let userCommand: string;
+    const presetCommand = /^\/\w+\b/g.exec(command)?.[0];
+    const presetConfig = presetCommand && this.config.chat.edit.presetCommands[presetCommand];
+    if (presetConfig) {
+      promptTemplate = presetConfig.promptTemplate;
+      userCommand = command.substring(presetCommand.length);
+    } else {
+      promptTemplate = insertMode
+        ? this.config.chat.edit.promptTemplate.insert
+        : this.config.chat.edit.promptTemplate.replace;
+      userCommand = command;
+    }
+    // Extract the selected text and the surrounding context
+    const documentSelection = document.substring(selection.start, selection.end);
+    let documentPrefix = document.substring(0, selection.start);
+    let documentSuffix = document.substring(selection.end);
+    if (document.length > documentMaxChars) {
+      const charsRemain = documentMaxChars - documentSelection.length;
+      if (documentPrefix.length < charsRemain / 2) {
+        documentSuffix = documentSuffix.substring(0, charsRemain - documentPrefix.length);
+      } else if (documentSuffix.length < charsRemain / 2) {
+        documentPrefix = documentPrefix.substring(documentPrefix.length - charsRemain + documentSuffix.length);
+      } else {
+        documentPrefix = documentPrefix.substring(documentPrefix.length - charsRemain / 2);
+        documentSuffix = documentSuffix.substring(0, charsRemain / 2);
+      }
+    }
+    // request chat api
+    const requestId = uuid();
+    try {
+      if (!this.api) {
+        throw new Error("http client not initialized");
+      }
+      const requestPath = options?.useBetaVersion ? "/v1beta/chat/completions" : "/v1/chat/completions";
+      const messages = [
+        {
+          role: "user",
+          content: promptTemplate.replace(
+            /{{filepath}}|{{documentPrefix}}|{{document}}|{{documentSuffix}}|{{command}}|{{languageId}}/g,
+            (pattern: string) => {
+              switch (pattern) {
+                case "{{filepath}}":
+                  return filepath;
+                case "{{documentPrefix}}":
+                  return documentPrefix;
+                case "{{document}}":
+                  return documentSelection;
+                case "{{documentSuffix}}":
+                  return documentSuffix;
+                case "{{command}}":
+                  return userCommand;
+                case "{{languageId}}":
+                  return languageId;
+                default:
+                  return "";
+              }
+            },
+          ),
+        },
+      ];
+      const requestOptions = {
+        body: { messages },
+        signal: this.createAbortSignal(options),
+        parseAs: "stream" as ParseAs,
+      };
+      const requestDescription = `POST ${this.config.server.endpoint + requestPath}`;
+      this.logger.debug(`Chat request: ${requestDescription}. [${requestId}]`);
+      this.logger.trace(`Chat request body: [${requestId}]`, requestOptions.body);
+      const response = await this.api.POST(requestPath, requestOptions);
+      this.logger.debug(`Chat response status: ${response.response.status}. [${requestId}]`);
+      if (response.error || !response.response.ok) {
+        throw new HttpError(response.response);
+      }
+      if (!response.response.body) {
+        return null;
+      }
+      const readableStream = readChatStream(response.response.body, requestOptions.signal);
+      return readableStream;
+    } catch (error) {
+      if (error instanceof HttpError && error.status == 404 && !options?.useBetaVersion) {
+        return await this.provideChatEdit(document, selection, filepath, insertMode, command, languageId, {
+          ...options,
+          useBetaVersion: true,
+        });
+      }
+      if (isCanceledError(error)) {
+        this.logger.debug(`Chat request canceled. [${requestId}]`);
+      } else if (isUnauthorizedError(error)) {
+        this.logger.debug(`Chat request failed due to unauthorized. [${requestId}]`);
+      } else {
+        this.logger.error(`Chat request failed. [${requestId}]`, error);
+      }
+      this.healthCheck(); // schedule a health check
+      return null;
+    }
   }
 }

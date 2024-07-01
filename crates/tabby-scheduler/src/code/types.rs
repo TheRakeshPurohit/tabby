@@ -1,9 +1,15 @@
-use std::{ops::Range, path::Path};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
+use crate::indexer::{IndexId, ToIndexId};
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SourceCode {
+    pub id: String,
     pub git_url: String,
     pub basedir: String,
     pub filepath: String,
@@ -11,13 +17,28 @@ pub struct SourceCode {
     pub max_line_length: usize,
     pub avg_line_length: f32,
     pub alphanum_fraction: f32,
+    pub number_fraction: f32,
+    pub num_lines: usize,
     pub tags: Vec<Tag>,
+}
+
+impl ToIndexId for SourceCode {
+    fn to_index_id(&self) -> IndexId {
+        IndexId {
+            source_id: self.git_url.clone(),
+            id: self.id.clone(),
+        }
+    }
 }
 
 impl SourceCode {
     pub fn read_content(&self) -> std::io::Result<String> {
-        let path = Path::new(&self.basedir).join(&self.filepath);
+        let path = self.absolute_path();
         std::fs::read_to_string(path)
+    }
+
+    pub fn absolute_path(&self) -> PathBuf {
+        Path::new(&self.basedir).join(&self.filepath)
     }
 }
 

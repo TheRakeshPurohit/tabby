@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use juniper::ID;
+use juniper::{GraphQLEnum, GraphQLObject, ID};
 use strum::EnumIter;
+use url::Url;
 
-use crate::Result;
+use crate::{juniper::relay::NodeType, Context, CoreError, Result};
 
-#[derive(Clone, EnumIter)]
+#[derive(Clone, EnumIter, GraphQLEnum)]
 pub enum IntegrationKind {
     Github,
     Gitlab,
@@ -13,13 +14,40 @@ pub enum IntegrationKind {
     GitlabSelfHosted,
 }
 
-#[derive(PartialEq, Eq, Debug)]
+impl IntegrationKind {
+    pub fn format_authenticated_url(&self, git_url: &str, access_token: &str) -> Result<String> {
+        let mut url = Url::parse(git_url).map_err(|e| CoreError::Other(e.into()))?;
+        match self {
+            IntegrationKind::Github | IntegrationKind::GithubSelfHosted => {
+                let _ = url.set_username(access_token);
+            }
+            IntegrationKind::Gitlab | IntegrationKind::GitlabSelfHosted => {
+                let _ = url.set_username("oauth2");
+                let _ = url.set_password(Some(access_token));
+            }
+        }
+        Ok(url.to_string())
+    }
+
+    pub fn is_self_hosted(&self) -> bool {
+        match self {
+            IntegrationKind::Github => false,
+            IntegrationKind::Gitlab => false,
+            IntegrationKind::GithubSelfHosted => true,
+            IntegrationKind::GitlabSelfHosted => true,
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Debug, GraphQLEnum)]
 pub enum IntegrationStatus {
     Ready,
     Pending,
     Failed,
 }
 
+#[derive(GraphQLObject)]
+#[graphql(context = Context)]
 pub struct Integration {
     pub id: ID,
     pub kind: IntegrationKind,
@@ -29,6 +57,22 @@ pub struct Integration {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub status: IntegrationStatus,
+}
+
+impl NodeType for Integration {
+    type Cursor = String;
+
+    fn cursor(&self) -> Self::Cursor {
+        self.id.to_string()
+    }
+
+    fn connection_type_name() -> &'static str {
+        "IntegrationConnection"
+    }
+
+    fn edge_type_name() -> &'static str {
+        "IntegrationEdge"
+    }
 }
 
 impl Integration {

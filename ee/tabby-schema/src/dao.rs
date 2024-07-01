@@ -41,6 +41,7 @@ impl From<JobRunDAO> for job::JobRun {
             job: run.name,
             created_at: *run.created_at,
             updated_at: *run.updated_at,
+            started_at: run.started_at.into_option(),
             finished_at: run.finished_at.into_option(),
             exit_code: run.exit_code.map(|i| i as i32),
             stdout: run.stdout,
@@ -173,6 +174,7 @@ impl From<Integration> for GithubRepositoryProvider {
             display_name: value.display_name,
             status: value.status.into(),
             access_token: Some(value.access_token),
+            api_base: value.api_base,
         }
     }
 }
@@ -184,6 +186,7 @@ impl From<Integration> for GitlabRepositoryProvider {
             display_name: value.display_name,
             status: value.status.into(),
             access_token: Some(value.access_token),
+            api_base: value.api_base,
         }
     }
 }

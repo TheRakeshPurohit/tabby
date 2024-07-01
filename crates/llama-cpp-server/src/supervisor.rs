@@ -4,23 +4,27 @@ use std::{
     process::Stdio,
 };
 
-use tokio::task::JoinHandle;
-use tracing::warn;
+use tokio::{io::AsyncBufReadExt, task::JoinHandle};
+use tracing::{debug, warn};
 use which::which;
 
 use crate::api_endpoint;
 
 pub struct LlamaCppSupervisor {
+    name: &'static str,
     port: u16,
     handle: JoinHandle<()>,
 }
 
 impl LlamaCppSupervisor {
     pub fn new(
+        name: &'static str,
         num_gpu_layers: u16,
         embedding: bool,
         model_path: &str,
         parallelism: u8,
+        chat_template: Option<String>,
+        enable_fast_attention: bool,
     ) -> LlamaCppSupervisor {
         let Some(binary_name) = find_binary_name() else {
             panic!("Failed to locate llama-server binary, please make sure you have llama-server binary locates in the same directory as the current executable.");
@@ -36,8 +40,7 @@ impl LlamaCppSupervisor {
                     .expect("Failed to get parent directory")
                     .join(&binary_name)
                     .display()
-                    .to_string()
-                    + std::env::consts::EXE_SUFFIX;
+                    .to_string();
                 let mut command = tokio::process::Command::new(server_binary);
 
                 command
@@ -52,7 +55,7 @@ impl LlamaCppSupervisor {
                     .arg("--ctx-size")
                     .arg(env::var("LLAMA_CPP_N_CONTEXT_SIZE").unwrap_or("4096".into()))
                     .kill_on_drop(true)
-                    .stderr(Stdio::null())
+                    .stderr(Stdio::piped())
                     .stdout(Stdio::null());
 
                 if let Ok(n_threads) = std::env::var("LLAMA_CPP_N_THREADS") {
@@ -70,10 +73,18 @@ impl LlamaCppSupervisor {
                         .arg(var("LLAMA_CPP_EMBEDDING_N_UBATCH_SIZE").unwrap_or("4096".into()));
                 }
 
+                if let Some(chat_template) = chat_template.as_ref() {
+                    command.arg("--chat-template").arg(chat_template);
+                }
+
+                if enable_fast_attention {
+                    command.arg("-fa");
+                };
+
                 let mut process = command.spawn().unwrap_or_else(|e| {
                     panic!(
-                        "Failed to start llama-server with command {:?}: {}",
-                        command, e
+                        "Failed to start llama-server <{}> with command {:?}: {}",
+                        name, command, e
                     )
                 });
 
@@ -86,14 +97,26 @@ impl LlamaCppSupervisor {
 
                 if status_code != 0 {
                     warn!(
-                        "llama-server exited with status code {}, restarting...",
-                        status_code
+                        "llama-server <{}> exited with status code {}",
+                        name, status_code
                     );
+                    let mut stderr = process
+                        .stderr
+                        .take()
+                        .map(tokio::io::BufReader::new)
+                        .map(|reader| reader.lines())
+                        .expect("Failed to read stderr");
+
+                    while let Ok(Some(line)) = stderr.next_line().await {
+                        warn!("<{}>: {}", name, line);
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
         });
 
-        Self { handle, port }
+        Self { name, handle, port }
     }
 
     pub fn port(&self) -> u16 {
@@ -101,6 +124,7 @@ impl LlamaCppSupervisor {
     }
 
     pub async fn start(&self) {
+        debug!("Waiting for llama-server <{}> to start...", self.name);
         let client = reqwest::Client::new();
         loop {
             let Ok(resp) = client.get(api_endpoint(self.port) + "/health").send().await else {
@@ -108,6 +132,7 @@ impl LlamaCppSupervisor {
             };
 
             if resp.status().is_success() {
+                debug!("llama-server <{}> started successfully", self.name);
                 return;
             }
         }

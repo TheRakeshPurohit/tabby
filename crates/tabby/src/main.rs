@@ -8,7 +8,7 @@ mod serve;
 use std::os::unix::fs::PermissionsExt;
 
 use clap::{Parser, Subcommand};
-use tabby_common::config::{Config, ConfigRepositoryAccess, LocalModelConfig, ModelConfig};
+use tabby_common::config::{Config, LocalModelConfig, ModelConfig};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
@@ -31,16 +31,6 @@ pub enum Commands {
 
     /// Download the language model for serving.
     Download(download::DownloadArgs),
-
-    /// Run scheduler progress for cron jobs integrating external code repositories.
-    Scheduler(SchedulerArgs),
-}
-
-#[derive(clap::Args)]
-pub struct SchedulerArgs {
-    /// If true, runs scheduler jobs immediately.
-    #[clap(long, default_value_t = false)]
-    now: bool,
 }
 
 #[derive(clap::ValueEnum, strum::Display, PartialEq, Clone)]
@@ -68,7 +58,7 @@ async fn main() {
     let cli = Cli::parse();
     init_logging();
 
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load().expect("Must be able to load config");
     let root = tabby_common::path::tabby_root();
     std::fs::create_dir_all(&root).expect("Must be able to create tabby root");
     #[cfg(target_family = "unix")]
@@ -81,9 +71,6 @@ async fn main() {
     match cli.command {
         Commands::Serve(ref args) => serve::main(&config, args).await,
         Commands::Download(ref args) => download::main(args).await,
-        Commands::Scheduler(SchedulerArgs { now, .. }) => {
-            tabby_scheduler::scheduler(now, &config, ConfigRepositoryAccess).await
-        }
     }
 }
 
@@ -115,9 +102,9 @@ fn init_logging() {
     layers.push(fmt_layer);
 
     let mut dirs = if cfg!(feature = "prod") {
-        "tabby=info,otel=debug".into()
+        "tabby=info,otel=debug,http_api_bindings=info,llama_cpp_server=info".into()
     } else {
-        "tabby=debug,otel=debug".into()
+        "tabby=debug,otel=debug,http_api_bindings=debug,llama_cpp_server=debug".into()
     };
 
     if let Ok(env) = std::env::var(EnvFilter::DEFAULT_ENV) {
@@ -142,11 +129,12 @@ fn to_local_config(model: &str, parallelism: u8, device: &Device) -> ModelConfig
             .flatten()
             .unwrap_or(9999)
     } else {
-        9999
+        0
     };
     ModelConfig::Local(LocalModelConfig {
         model_id: model.to_owned(),
         parallelism,
         num_gpu_layers,
+        enable_fast_attention: false,
     })
 }

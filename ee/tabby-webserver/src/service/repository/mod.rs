@@ -6,39 +6,44 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use juniper::ID;
-use tabby_common::config::{RepositoryAccess, RepositoryConfig};
+use tabby_common::{
+    config::{config_id_to_index, config_index_to_id, Config, RepositoryConfig},
+    index::corpus,
+};
 use tabby_db::DbConn;
 use tabby_schema::{
     integration::IntegrationService,
+    job::JobService,
     repository::{
         FileEntrySearchResult, GitRepositoryService, ProvidedRepository, Repository,
         RepositoryKind, RepositoryService, ThirdPartyRepositoryService,
     },
     Result,
 };
-use tokio::sync::mpsc::UnboundedSender;
-
-use crate::service::background_job::BackgroundJobEvent;
 
 struct RepositoryServiceImpl {
     git: Arc<dyn GitRepositoryService>,
     third_party: Arc<dyn ThirdPartyRepositoryService>,
+    config: Vec<RepositoryConfig>,
 }
 
 pub fn create(
     db: DbConn,
     integration: Arc<dyn IntegrationService>,
-    background: UnboundedSender<BackgroundJobEvent>,
+    job: Arc<dyn JobService>,
 ) -> Arc<dyn RepositoryService> {
     Arc::new(RepositoryServiceImpl {
-        git: Arc::new(git::create(db.clone(), background.clone())),
-        third_party: Arc::new(third_party::create(db, integration, background.clone())),
+        git: Arc::new(git::create(db.clone(), job.clone())),
+        third_party: Arc::new(third_party::create(db, integration, job.clone())),
+        config: Config::load()
+            .map(|config| config.repositories)
+            .unwrap_or_default(),
     })
 }
 
 #[async_trait]
-impl RepositoryAccess for RepositoryServiceImpl {
-    async fn list_repositories(&self) -> anyhow::Result<Vec<RepositoryConfig>> {
+impl RepositoryService for RepositoryServiceImpl {
+    async fn list_all_repository_urls(&self) -> Result<Vec<RepositoryConfig>> {
         let mut repos: Vec<RepositoryConfig> = self
             .git
             .list(None, None, None, None)
@@ -56,10 +61,26 @@ impl RepositoryAccess for RepositoryServiceImpl {
 
         Ok(repos)
     }
-}
 
-#[async_trait]
-impl RepositoryService for RepositoryServiceImpl {
+    async fn list_all_sources(&self) -> Result<Vec<(String, String)>> {
+        let mut sources: Vec<_> = self
+            .list_all_repository_urls()
+            .await?
+            .into_iter()
+            .map(|config| (corpus::CODE.into(), config.canonical_git_url()))
+            .collect();
+
+        sources.extend(
+            self.third_party()
+                .list_repositories_with_filter(None, None, Some(true), None, None, None, None)
+                .await?
+                .into_iter()
+                .map(|repo| (corpus::WEB.into(), repo.source_id())),
+        );
+
+        Ok(sources)
+    }
+
     fn git(&self) -> Arc<dyn GitRepositoryService> {
         self.git.clone()
     }
@@ -68,19 +89,29 @@ impl RepositoryService for RepositoryServiceImpl {
         self.third_party.clone()
     }
 
-    fn access(self: Arc<Self>) -> Arc<dyn RepositoryAccess> {
-        self.clone()
-    }
-
     async fn repository_list(&self) -> Result<Vec<Repository>> {
         let mut all = vec![];
         all.extend(self.git().repository_list().await?);
         all.extend(self.third_party().repository_list().await?);
+        all.extend(
+            self.config
+                .iter()
+                .enumerate()
+                .map(|(index, repo)| repository_config_to_repository(index, repo))
+                .collect::<Result<Vec<_>>>()?,
+        );
 
         Ok(all)
     }
 
     async fn resolve_repository(&self, kind: &RepositoryKind, id: &ID) -> Result<Repository> {
+        if let RepositoryKind::Git = kind {
+            if let Ok(index) = config_id_to_index(id) {
+                let config = &self.config[index];
+                return repository_config_to_repository(index, config);
+            }
+        }
+
         match kind {
             RepositoryKind::Git => self.git().get_repository(id).await,
             RepositoryKind::Github
@@ -196,23 +227,31 @@ fn to_repository(kind: RepositoryKind, repo: ProvidedRepository) -> Repository {
     }
 }
 
+fn repository_config_to_repository(index: usize, config: &RepositoryConfig) -> Result<Repository> {
+    Ok(Repository {
+        id: ID::new(config_index_to_id(index)),
+        name: config.dir_name(),
+        kind: RepositoryKind::Git,
+        dir: config.dir(),
+        refs: tabby_git::list_refs(&config.dir())?,
+        git_url: config.git_url.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use tabby_db::DbConn;
 
     use super::*;
-
-    fn create_fake() -> UnboundedSender<BackgroundJobEvent> {
-        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
-        sender
-    }
+    use crate::job;
 
     #[tokio::test]
     async fn test_list_repositories() {
         let db = DbConn::new_in_memory().await.unwrap();
-        let background = create_fake();
-        let integration = Arc::new(crate::service::integration::create(db.clone(), background));
-        let service = create(db.clone(), integration, create_fake());
+        let job_service = Arc::new(job::create(db.clone()).await);
+        let integration = Arc::new(crate::service::integration::create(db.clone(), job_service));
+        let job = Arc::new(crate::service::job::create(db.clone()).await);
+        let service = create(db.clone(), integration, job);
         service
             .git()
             .create("test_git_repo".into(), "http://test_git_repo".into())
@@ -220,7 +259,7 @@ mod tests {
             .unwrap();
 
         // FIXME(boxbeam): add repo with github service once there's syncing logic.
-        let repos = service.list_repositories().await.unwrap();
+        let repos = service.list_all_repository_urls().await.unwrap();
         assert_eq!(repos.len(), 1);
     }
 }

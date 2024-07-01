@@ -20,6 +20,9 @@ use crate::services::chat::{ChatCompletionRequestBuilder, ChatService};
     ],
 }))]
 pub struct AnswerRequest {
+    #[serde(default)]
+    pub(crate) user: Option<String>,
+
     messages: Vec<Message>,
 
     #[serde(default)]
@@ -43,20 +46,15 @@ pub enum AnswerResponseChunk {
 pub struct AnswerService {
     chat: Arc<ChatService>,
     code: Arc<dyn CodeSearch>,
-    doc: Option<Arc<dyn DocSearch>>,
+    doc: Arc<dyn DocSearch>,
     serper: Option<Box<dyn DocSearch>>,
 }
 
 // FIXME(meng): make this configurable.
-const RELEVANT_CODE_THRESHOLD: f32 = 5.5;
 const PRESENCE_PENALTY: f32 = 0.5;
 
 impl AnswerService {
-    fn new(
-        chat: Arc<ChatService>,
-        code: Arc<dyn CodeSearch>,
-        doc: Option<Arc<dyn DocSearch>>,
-    ) -> Self {
+    fn new(chat: Arc<ChatService>, code: Arc<dyn CodeSearch>, doc: Arc<dyn DocSearch>) -> Self {
         let serper: Option<Box<dyn DocSearch>> =
             if let Ok(api_key) = std::env::var("SERPER_API_KEY") {
                 debug!("Serper API key found, enabling serper...");
@@ -125,7 +123,8 @@ impl AnswerService {
 
             // 5. Generate answer from the query
             let s = self.chat.clone().generate(ChatCompletionRequestBuilder::default()
-                .messages(req.messages.clone())
+                .messages(req.messages)
+                .user(req.user)
                 .presence_penalty(Some(PRESENCE_PENALTY))
                 .build()
                 .expect("Failed to create ChatCompletionRequest"))
@@ -140,7 +139,7 @@ impl AnswerService {
     }
 
     async fn collect_relevant_code(&self, query: CodeSearchQuery) -> Vec<CodeSearchDocument> {
-        let hits = match self.code.search_in_language(query, 5, 0).await {
+        let hits = match self.code.search_in_language(query, 20).await {
             Ok(docs) => docs.hits,
             Err(err) => {
                 if let CodeSearchError::NotReady = err {
@@ -153,7 +152,12 @@ impl AnswerService {
         };
 
         hits.into_iter()
-            .filter(|hit| hit.score > RELEVANT_CODE_THRESHOLD)
+            .inspect(|hit| {
+                debug!(
+                    "Code search hit: {:?}, score {:?}",
+                    hit.doc.filepath, hit.scores
+                )
+            })
             .map(|hit| hit.doc)
             .collect()
     }
@@ -161,24 +165,22 @@ impl AnswerService {
     async fn collect_relevant_docs(&self, query: &str) -> Vec<DocSearchDocument> {
         // 1. Collect relevant docs from the tantivy doc search.
         let mut hits = vec![];
-        if let Some(doc) = self.doc.as_ref() {
-            let doc_hits = match doc.search(query, 5, 0).await {
-                Ok(docs) => docs.hits,
-                Err(err) => {
-                    if let DocSearchError::NotReady = err {
-                        debug!("Doc search is not ready yet");
-                    } else {
-                        warn!("Failed to search doc: {:?}", err);
-                    }
-                    vec![]
+        let doc_hits = match self.doc.search(query, 5).await {
+            Ok(docs) => docs.hits,
+            Err(err) => {
+                if let DocSearchError::NotReady = err {
+                    debug!("Doc search is not ready yet");
+                } else {
+                    warn!("Failed to search doc: {:?}", err);
                 }
-            };
-            hits.extend(doc_hits);
-        }
+                vec![]
+            }
+        };
+        hits.extend(doc_hits);
 
         // 2. If serper is available, we also collect from serper
         if let Some(serper) = self.serper.as_ref() {
-            let serper_hits = match serper.search(query, 5, 0).await {
+            let serper_hits = match serper.search(query, 5).await {
                 Ok(docs) => docs.hits,
                 Err(err) => {
                     warn!("Failed to search serper: {:?}", err);
@@ -188,7 +190,10 @@ impl AnswerService {
             hits.extend(serper_hits);
         }
 
-        hits.into_iter().map(|hit| hit.doc).collect()
+        hits.into_iter()
+            .inspect(|hit| debug!("Doc search hit: {:?}, score {:?}", hit.doc.link, hit.score))
+            .map(|hit| hit.doc)
+            .collect()
     }
 
     async fn generate_relevant_questions(
@@ -310,7 +315,7 @@ fn remove_bullet_prefix(s: &str) -> String {
 pub fn create(
     chat: Arc<ChatService>,
     code: Arc<dyn CodeSearch>,
-    doc: Option<Arc<dyn DocSearch>>,
+    doc: Arc<dyn DocSearch>,
 ) -> AnswerService {
     AnswerService::new(chat, code, doc)
 }

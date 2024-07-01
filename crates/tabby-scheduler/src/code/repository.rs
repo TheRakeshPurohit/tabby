@@ -54,10 +54,9 @@ fn pull_remote(path: &Path) -> bool {
     if let Some(code) = status.code() {
         if code != 0 {
             warn!(
-                "Failed to pull remote for `{:?}`, It will now be removed...",
+                "Failed to pull remote for `{:?}`, please check your repository configuration...",
                 path
             );
-            fs::remove_dir_all(path).expect("Failed to remove directory");
             return false;
         }
     };
@@ -78,10 +77,11 @@ pub fn sync_repository(repository: &RepositoryConfig) {
 pub fn garbage_collection(repositories: &[RepositoryConfig]) {
     let names = repositories.iter().map(|r| r.dir()).collect::<HashSet<_>>();
 
-    for file in fs::read_dir(repositories_dir())
-        .expect("Failed to read repository dir")
-        .filter_map(Result::ok)
-    {
+    let Ok(dir) = fs::read_dir(repositories_dir()) else {
+        return;
+    };
+
+    for file in dir.filter_map(Result::ok) {
         let metadata = file.metadata().expect("Failed to read metadata");
         let filename = file.file_name();
         if metadata.is_file() {

@@ -1,180 +1,156 @@
 use std::sync::Arc;
 
 use async_stream::stream;
-use futures::{Stream, StreamExt};
-use tabby_common::{index::DocSearchSchema, path};
+use async_trait::async_trait;
+use futures::{stream::BoxStream, StreamExt};
+use serde_json::json;
+use tabby_common::index::{self, corpus, doc};
 use tabby_inference::Embedding;
-use tantivy::{doc, IndexWriter, TantivyDocument, Term};
+use tantivy::doc;
 use text_splitter::TextSplitter;
+use tokio::task::JoinHandle;
 use tracing::warn;
 
-use crate::tantivy_utils::open_or_create_index;
+use crate::{
+    indexer::{IndexId, TantivyDocBuilder, ToIndexId},
+    IndexAttributeBuilder, Indexer,
+};
 
 pub struct SourceDocument {
+    pub source_id: String,
     pub id: String,
     pub title: String,
     pub link: String,
     pub body: String,
 }
 
-pub struct DocIndex {
-    embedding: Arc<dyn Embedding>,
-    writer: IndexWriter,
+impl ToIndexId for SourceDocument {
+    fn to_index_id(&self) -> IndexId {
+        IndexId {
+            source_id: self.source_id.clone(),
+            id: self.id.clone(),
+        }
+    }
 }
 
 const CHUNK_SIZE: usize = 2048;
 
-impl DocIndex {
-    pub fn new(embedding: Arc<dyn Embedding>) -> Self {
-        let doc = DocSearchSchema::instance();
-        let (_, index) = open_or_create_index(&doc.schema, &path::doc_index_dir());
-        let writer = index
-            .writer(150_000_000)
-            .expect("Failed to create index writer");
+pub struct DocBuilder {
+    embedding: Arc<dyn Embedding>,
+}
 
-        Self { embedding, writer }
+impl DocBuilder {
+    fn new(embedding: Arc<dyn Embedding>) -> Self {
+        Self { embedding }
     }
+}
 
-    pub async fn add(&mut self, document: SourceDocument) {
-        let doc = DocSearchSchema::instance();
-
-        // Delete the document if it already exists
-        self.writer
-            .delete_term(Term::from_field_text(doc.field_id, &document.id));
-
-        self.iter_docs(document)
-            .await
-            .for_each(|doc| async {
-                self.writer
-                    .add_document(doc)
-                    .expect("Failed to add document");
-            })
-            .await;
-    }
-
-    async fn iter_docs(&self, document: SourceDocument) -> impl Stream<Item = TantivyDocument> {
-        let doc = DocSearchSchema::instance();
-
-        let id = document.id.clone();
-        let content = document.body.clone();
-
-        let doc = doc! {
-            doc.field_id => document.id,
-            doc.field_title => document.title,
-            doc.field_link => document.link,
-        };
-
-        futures::stream::once(async { doc }).chain(self.iter_chunks(id, content).await)
+#[async_trait]
+impl IndexAttributeBuilder<SourceDocument> for DocBuilder {
+    async fn build_attributes(&self, document: &SourceDocument) -> serde_json::Value {
+        json!({
+            doc::fields::TITLE: document.title,
+            doc::fields::LINK: document.link,
+        })
     }
 
     /// This function splits the document into chunks and computes the embedding for each chunk. It then converts the embeddings
     /// into binarized tokens by thresholding on zero.
-    async fn iter_chunks(
+    async fn build_chunk_attributes(
         &self,
-        id: String,
-        content: String,
-    ) -> impl Stream<Item = TantivyDocument> {
-        let splitter = TextSplitter::default().with_trim_chunks(true);
+        document: &SourceDocument,
+    ) -> BoxStream<JoinHandle<(Vec<String>, serde_json::Value)>> {
         let embedding = self.embedding.clone();
+        let chunks: Vec<_> = TextSplitter::new(CHUNK_SIZE)
+            .chunks(&document.body)
+            .map(|x| x.to_owned())
+            .collect();
 
-        stream! {
-            let schema = DocSearchSchema::instance();
-            for (chunk_id, chunk_text) in splitter.chunks(&content, CHUNK_SIZE).enumerate() {
-                let mut doc = doc! {
-                    schema.field_id => id.clone(),
-                    schema.field_chunk_id => chunk_id.to_string(),
-                    schema.field_chunk_text => chunk_text.to_owned(),
-                };
+        let s = stream! {
+            for chunk_text in chunks {
+                let embedding = embedding.clone();
+                yield tokio::spawn(async move {
+                    let chunk_embedding_tokens = build_tokens(embedding.clone(), &chunk_text).await;
+                    let chunk = json!({
+                        doc::fields::CHUNK_TEXT: chunk_text,
+                    });
 
-                let embedding = match embedding.embed(chunk_text).await {
-                    Ok(embedding) => embedding,
-                    Err(err) => {
-                        warn!("Failed to embed chunk {} of document '{}': {}", chunk_id, id, err);
-                        continue;
-                    }
-                };
-
-                for token in DocSearchSchema::binarize_embedding(embedding.iter()) {
-                    doc.add_text(schema.field_chunk_embedding_token, token);
-                }
-
-                yield doc;
+                    (chunk_embedding_tokens, chunk)
+                });
             }
-        }
-    }
+        };
 
-    pub fn delete(&mut self, id: &str) {
-        self.writer.delete_term(Term::from_field_text(
-            DocSearchSchema::instance().field_id,
-            id,
-        ));
-    }
-
-    pub fn commit(mut self) {
-        self.writer.commit().expect("Failed to commit changes");
-        self.writer
-            .wait_merging_threads()
-            .expect("Failed to wait for merging threads");
+        Box::pin(s)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use async_trait::async_trait;
-    use tantivy::schema::Value;
+async fn build_tokens(embedding: Arc<dyn Embedding>, text: &str) -> Vec<String> {
+    let embedding = match embedding.embed(text).await {
+        Ok(embedding) => embedding,
+        Err(err) => {
+            warn!("Failed to embed chunk text: {}", err);
+            return vec![];
+        }
+    };
 
-    use super::*;
+    let mut chunk_embedding_tokens = vec![];
+    for token in index::binarize_embedding(embedding.iter()) {
+        chunk_embedding_tokens.push(token);
+    }
 
-    struct DummyEmbedding;
+    chunk_embedding_tokens
+}
 
-    #[async_trait]
-    impl Embedding for DummyEmbedding {
-        async fn embed(&self, prompt: &str) -> anyhow::Result<Vec<f32>> {
-            Ok(vec![0.0; prompt.len()])
+pub fn create_web_builder(embedding: Arc<dyn Embedding>) -> TantivyDocBuilder<SourceDocument> {
+    let builder = DocBuilder::new(embedding);
+    TantivyDocBuilder::new(corpus::WEB, builder)
+}
+
+pub struct DocIndexer {
+    builder: TantivyDocBuilder<SourceDocument>,
+    indexer: Indexer,
+}
+
+pub struct WebDocument {
+    pub id: String,
+    pub source_id: String,
+    pub link: String,
+    pub title: String,
+    pub body: String,
+}
+
+impl From<WebDocument> for SourceDocument {
+    fn from(value: WebDocument) -> Self {
+        Self {
+            id: value.id,
+            source_id: value.source_id,
+            link: value.link,
+            title: value.title,
+            body: value.body,
         }
     }
+}
 
-    fn new_test_index() -> DocIndex {
-        DocIndex::new(Arc::new(DummyEmbedding))
+impl DocIndexer {
+    pub fn new(embedding: Arc<dyn Embedding>) -> Self {
+        let builder = create_web_builder(embedding);
+        let indexer = Indexer::new(corpus::WEB);
+        Self { indexer, builder }
     }
 
-    fn is_empty(doc: &TantivyDocument, field: tantivy::schema::Field) -> bool {
-        doc.get_first(field).is_none()
+    pub async fn add(&self, document: WebDocument) {
+        stream! {
+            let (id, s) = self.builder.build(document.into()).await;
+            self.indexer.delete(&id);
+            for await doc in s.buffer_unordered(std::cmp::max(std::thread::available_parallelism().unwrap().get() * 2, 32)) {
+                if let Ok(Some(doc)) = doc {
+                    self.indexer.add(doc).await;
+                }
+            }
+        }.collect::<()>().await;
     }
 
-    fn get_text(doc: &TantivyDocument, field: tantivy::schema::Field) -> String {
-        doc.get_first(field).unwrap().as_str().unwrap().to_string()
-    }
-
-    #[tokio::test]
-    async fn test_iter_docs() {
-        let index = new_test_index();
-        let document = SourceDocument {
-            id: "test".to_string(),
-            title: "Test".to_string(),
-            link: "https://example.com".to_string(),
-            body: "Hello, world!".to_string(),
-        };
-        let docs = index.iter_docs(document).await.collect::<Vec<_>>().await;
-        assert_eq!(2, docs.len());
-
-        let schema = DocSearchSchema::instance();
-
-        // Check document
-        assert_eq!("test", get_text(&docs[0], schema.field_id));
-        assert!(is_empty(&docs[0], schema.field_chunk_id));
-        assert!(is_empty(&docs[0], schema.field_chunk_text));
-        assert!(is_empty(&docs[0], schema.field_chunk_embedding_token));
-
-        // Check chunks.
-        assert_eq!("test", get_text(&docs[1], schema.field_id));
-        assert!(is_empty(&docs[1], schema.field_title));
-        assert!(is_empty(&docs[1], schema.field_link));
-
-        assert_eq!("0", get_text(&docs[1], schema.field_chunk_id));
-        assert_eq!(
-            "embedding_zero_0",
-            get_text(&docs[1], schema.field_chunk_embedding_token)
-        );
+    pub fn commit(self) {
+        self.indexer.commit();
     }
 }

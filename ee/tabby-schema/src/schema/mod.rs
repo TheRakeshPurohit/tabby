@@ -8,6 +8,7 @@ pub mod license;
 pub mod repository;
 pub mod setting;
 pub mod user_event;
+pub mod web_crawler;
 pub mod worker;
 
 use std::sync::Arc;
@@ -35,18 +36,22 @@ use self::{
         RequestInvitationInput, RequestPasswordResetEmailInput, UpdateOAuthCredentialInput,
     },
     email::{EmailService, EmailSetting, EmailSettingInput},
-    integration::{IntegrationKind, IntegrationService},
+    integration::{Integration, IntegrationKind, IntegrationService},
     job::JobStats,
     license::{IsLicenseValid, LicenseInfo, LicenseService, LicenseType},
-    repository::{FileEntrySearchResult, GrepFile, Repository, RepositoryKind, RepositoryService},
+    repository::{
+        CreateIntegrationInput, FileEntrySearchResult, GrepFile, ProvidedRepository, Repository,
+        RepositoryKind, RepositoryService, UpdateIntegrationInput,
+    },
     setting::{
         NetworkSetting, NetworkSettingInput, SecuritySetting, SecuritySettingInput, SettingService,
     },
     user_event::{UserEvent, UserEventService},
+    web_crawler::{CreateWebCrawlerUrlInput, WebCrawlerService, WebCrawlerUrl},
 };
 use crate::{
     env,
-    juniper::relay::{self, Connection},
+    juniper::relay::{self, query_async, Connection},
 };
 
 pub trait ServiceLocator: Send + Sync {
@@ -62,6 +67,7 @@ pub trait ServiceLocator: Send + Sync {
     fn license(&self) -> Arc<dyn LicenseService>;
     fn analytic(&self) -> Arc<dyn AnalyticService>;
     fn user_event(&self) -> Arc<dyn UserEventService>;
+    fn web_crawler(&self) -> Arc<dyn WebCrawlerService>;
 }
 
 pub struct Context {
@@ -200,282 +206,6 @@ impl Query {
                     .auth()
                     .list_invitations(after, before, first, last)
                     .await
-            },
-        )
-        .await
-    }
-
-    async fn github_repository_providers(
-        ctx: &Context,
-        ids: Option<Vec<ID>>,
-        after: Option<String>,
-        before: Option<String>,
-        first: Option<i32>,
-        last: Option<i32>,
-    ) -> Result<Connection<repository::GithubRepositoryProvider>> {
-        check_admin(ctx).await?;
-        relay::query_async(
-            after,
-            before,
-            first,
-            last,
-            |after, before, first, last| async move {
-                let providers = ctx
-                    .locator
-                    .integration()
-                    .list_integrations(
-                        ids,
-                        Some(IntegrationKind::Github),
-                        after,
-                        before,
-                        first,
-                        last,
-                    )
-                    .await?;
-                Ok(providers.into_iter().map(From::from).collect())
-            },
-        )
-        .await
-    }
-
-    async fn github_repositories(
-        ctx: &Context,
-        provider_ids: Vec<ID>,
-        active: Option<bool>,
-        after: Option<String>,
-        before: Option<String>,
-        first: Option<i32>,
-        last: Option<i32>,
-    ) -> Result<Connection<repository::GithubProvidedRepository>> {
-        check_admin(ctx).await?;
-        relay::query_async(
-            after,
-            before,
-            first,
-            last,
-            |after, before, first, last| async move {
-                let repositories = ctx
-                    .locator
-                    .repository()
-                    .third_party()
-                    .list_repositories_with_filter(
-                        Some(provider_ids),
-                        Some(IntegrationKind::Github),
-                        active,
-                        after,
-                        before,
-                        first,
-                        last,
-                    )
-                    .await?;
-                Ok(repositories.into_iter().map(From::from).collect())
-            },
-        )
-        .await
-    }
-
-    async fn github_self_hosted_repositories(
-        ctx: &Context,
-        provider_ids: Vec<ID>,
-        active: Option<bool>,
-        after: Option<String>,
-        before: Option<String>,
-        first: Option<i32>,
-        last: Option<i32>,
-    ) -> Result<Connection<repository::GithubProvidedRepository>> {
-        check_admin(ctx).await?;
-        relay::query_async(
-            after,
-            before,
-            first,
-            last,
-            |after, before, first, last| async move {
-                let repositories = ctx
-                    .locator
-                    .repository()
-                    .third_party()
-                    .list_repositories_with_filter(
-                        Some(provider_ids),
-                        Some(IntegrationKind::GithubSelfHosted),
-                        active,
-                        after,
-                        before,
-                        first,
-                        last,
-                    )
-                    .await?;
-                Ok(repositories.into_iter().map(From::from).collect())
-            },
-        )
-        .await
-    }
-
-    async fn gitlab_self_hosted_repositories(
-        ctx: &Context,
-        provider_ids: Vec<ID>,
-        active: Option<bool>,
-        after: Option<String>,
-        before: Option<String>,
-        first: Option<i32>,
-        last: Option<i32>,
-    ) -> Result<Connection<repository::GithubProvidedRepository>> {
-        check_admin(ctx).await?;
-        relay::query_async(
-            after,
-            before,
-            first,
-            last,
-            |after, before, first, last| async move {
-                let repositories = ctx
-                    .locator
-                    .repository()
-                    .third_party()
-                    .list_repositories_with_filter(
-                        Some(provider_ids),
-                        Some(IntegrationKind::GitlabSelfHosted),
-                        active,
-                        after,
-                        before,
-                        first,
-                        last,
-                    )
-                    .await?;
-                Ok(repositories.into_iter().map(From::from).collect())
-            },
-        )
-        .await
-    }
-
-    async fn gitlab_repository_providers(
-        ctx: &Context,
-        ids: Option<Vec<ID>>,
-        after: Option<String>,
-        before: Option<String>,
-        first: Option<i32>,
-        last: Option<i32>,
-    ) -> Result<Connection<repository::GitlabRepositoryProvider>> {
-        check_admin(ctx).await?;
-        relay::query_async(
-            after,
-            before,
-            first,
-            last,
-            |after, before, first, last| async move {
-                let integrations = ctx
-                    .locator
-                    .integration()
-                    .list_integrations(
-                        ids,
-                        Some(IntegrationKind::Gitlab),
-                        after,
-                        before,
-                        first,
-                        last,
-                    )
-                    .await?;
-                Ok(integrations.into_iter().map(From::from).collect())
-            },
-        )
-        .await
-    }
-
-    async fn gitlab_self_hosted_repository_providers(
-        ctx: &Context,
-        ids: Option<Vec<ID>>,
-        after: Option<String>,
-        before: Option<String>,
-        first: Option<i32>,
-        last: Option<i32>,
-    ) -> Result<Connection<repository::GitlabRepositoryProvider>> {
-        check_admin(ctx).await?;
-        relay::query_async(
-            after,
-            before,
-            first,
-            last,
-            |after, before, first, last| async move {
-                let integrations = ctx
-                    .locator
-                    .integration()
-                    .list_integrations(
-                        ids,
-                        Some(IntegrationKind::GitlabSelfHosted),
-                        after,
-                        before,
-                        first,
-                        last,
-                    )
-                    .await?;
-                Ok(integrations.into_iter().map(From::from).collect())
-            },
-        )
-        .await
-    }
-
-    async fn github_self_hosted_repository_providers(
-        ctx: &Context,
-        ids: Option<Vec<ID>>,
-        after: Option<String>,
-        before: Option<String>,
-        first: Option<i32>,
-        last: Option<i32>,
-    ) -> Result<Connection<repository::GitlabRepositoryProvider>> {
-        check_admin(ctx).await?;
-        relay::query_async(
-            after,
-            before,
-            first,
-            last,
-            |after, before, first, last| async move {
-                let integrations = ctx
-                    .locator
-                    .integration()
-                    .list_integrations(
-                        ids,
-                        Some(IntegrationKind::GithubSelfHosted),
-                        after,
-                        before,
-                        first,
-                        last,
-                    )
-                    .await?;
-                Ok(integrations.into_iter().map(From::from).collect())
-            },
-        )
-        .await
-    }
-
-    async fn gitlab_repositories(
-        ctx: &Context,
-        provider_ids: Vec<ID>,
-        active: Option<bool>,
-        after: Option<String>,
-        before: Option<String>,
-        first: Option<i32>,
-        last: Option<i32>,
-    ) -> Result<Connection<repository::GitlabProvidedRepository>> {
-        check_admin(ctx).await?;
-        relay::query_async(
-            after,
-            before,
-            first,
-            last,
-            |after, before, first, last| async move {
-                let repositories = ctx
-                    .locator
-                    .repository()
-                    .third_party()
-                    .list_repositories_with_filter(
-                        Some(provider_ids),
-                        Some(IntegrationKind::Gitlab),
-                        active,
-                        after,
-                        before,
-                        first,
-                        last,
-                    )
-                    .await?;
-                Ok(repositories.into_iter().map(From::from).collect())
             },
         )
         .await
@@ -620,7 +350,12 @@ impl Query {
 
     // FIXME(meng): This is a temporary solution to expose the list of jobs, we should consider switching to a enum based approach.
     async fn jobs() -> Result<Vec<String>> {
-        Ok(vec!["scheduler"].into_iter().map(Into::into).collect())
+        Ok(
+            vec!["scheduler_git", "scheduler_github_gitlab", "web_crawler"]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        )
     }
 
     async fn daily_stats_in_past_year(
@@ -692,7 +427,80 @@ impl Query {
 
     async fn repository_list(ctx: &Context) -> Result<Vec<Repository>> {
         check_user(ctx).await?;
+
         ctx.locator.repository().repository_list().await
+    }
+
+    async fn integrations(
+        ctx: &Context,
+        ids: Option<Vec<ID>>,
+        kind: Option<IntegrationKind>,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+    ) -> Result<Connection<Integration>> {
+        query_async(
+            after,
+            before,
+            first,
+            last,
+            |after, before, first, last| async move {
+                ctx.locator
+                    .integration()
+                    .list_integrations(ids, kind, after, before, first, last)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn integrated_repositories(
+        ctx: &Context,
+        ids: Option<Vec<ID>>,
+        kind: Option<IntegrationKind>,
+        active: Option<bool>,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+    ) -> Result<Connection<ProvidedRepository>> {
+        query_async(
+            after,
+            before,
+            first,
+            last,
+            |after, before, first, last| async move {
+                ctx.locator
+                    .repository()
+                    .third_party()
+                    .list_repositories_with_filter(ids, kind, active, after, before, first, last)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn web_crawler_urls(
+        ctx: &Context,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+    ) -> Result<Connection<WebCrawlerUrl>> {
+        query_async(
+            after,
+            before,
+            first,
+            last,
+            |after, before, first, last| async move {
+                ctx.locator
+                    .web_crawler()
+                    .list_web_crawler_urls(after, before, first, last)
+                    .await
+            },
+        )
+        .await
     }
 }
 
@@ -834,6 +642,7 @@ impl Mutation {
         password1: String,
         password2: String,
         invitation_code: Option<String>,
+        name: String,
     ) -> Result<RegisterResponse> {
         let input = auth::RegisterInput {
             email,
@@ -844,7 +653,7 @@ impl Mutation {
 
         ctx.locator
             .auth()
-            .register(input.email, input.password1, invitation_code)
+            .register(input.email, input.password1, invitation_code, Some(name))
             .await
     }
 
@@ -974,36 +783,13 @@ impl Mutation {
         Ok(true)
     }
 
-    async fn create_github_repository_provider(
-        ctx: &Context,
-        input: repository::CreateRepositoryProviderInput,
-    ) -> Result<ID> {
-        check_admin(ctx).await?;
+    async fn create_integration(ctx: &Context, input: CreateIntegrationInput) -> Result<ID> {
         input.validate()?;
         let id = ctx
             .locator
             .integration()
             .create_integration(
-                IntegrationKind::Github,
-                input.display_name,
-                input.access_token,
-                None,
-            )
-            .await?;
-        Ok(id)
-    }
-
-    async fn create_github_self_hosted_repository_provider(
-        ctx: &Context,
-        input: repository::CreateSelfHostedRepositoryProviderInput,
-    ) -> Result<ID> {
-        check_admin(ctx).await?;
-        input.validate()?;
-        let id = ctx
-            .locator
-            .integration()
-            .create_integration(
-                IntegrationKind::Github,
+                input.kind,
                 input.display_name,
                 input.access_token,
                 input.api_base,
@@ -1012,54 +798,13 @@ impl Mutation {
         Ok(id)
     }
 
-    async fn delete_github_repository_provider(ctx: &Context, id: ID) -> Result<bool> {
-        check_admin(ctx).await?;
-        ctx.locator
-            .integration()
-            .delete_integration(id, IntegrationKind::Github)
-            .await?;
-        Ok(true)
-    }
-
-    async fn delete_github_self_hosted_repository_provider(ctx: &Context, id: ID) -> Result<bool> {
-        check_admin(ctx).await?;
-        ctx.locator
-            .integration()
-            .delete_integration(id, IntegrationKind::GithubSelfHosted)
-            .await?;
-        Ok(true)
-    }
-
-    async fn update_github_repository_provider(
-        ctx: &Context,
-        input: repository::UpdateRepositoryProviderInput,
-    ) -> Result<bool> {
-        check_admin(ctx).await?;
+    async fn update_integration(ctx: &Context, input: UpdateIntegrationInput) -> Result<bool> {
         input.validate()?;
         ctx.locator
             .integration()
             .update_integration(
                 input.id,
-                IntegrationKind::Github,
-                input.display_name,
-                input.access_token,
-                None,
-            )
-            .await?;
-        Ok(true)
-    }
-
-    async fn update_github_self_hosted_repository_provider(
-        ctx: &Context,
-        input: repository::UpdateSelfHostedRepositoryProviderInput,
-    ) -> Result<bool> {
-        check_admin(ctx).await?;
-        input.validate()?;
-        ctx.locator
-            .integration()
-            .update_integration(
-                input.id,
-                IntegrationKind::Github,
+                input.kind,
                 input.display_name,
                 input.access_token,
                 input.api_base,
@@ -1068,7 +813,15 @@ impl Mutation {
         Ok(true)
     }
 
-    async fn update_github_provided_repository_active(
+    async fn delete_integration(ctx: &Context, id: ID, kind: IntegrationKind) -> Result<bool> {
+        ctx.locator
+            .integration()
+            .delete_integration(id, kind)
+            .await?;
+        Ok(true)
+    }
+
+    async fn update_integrated_repository_active(
         ctx: &Context,
         id: ID,
         active: bool,
@@ -1081,136 +834,24 @@ impl Mutation {
         Ok(true)
     }
 
-    async fn update_github_self_hosted_provided_repository_active(
-        ctx: &Context,
-        id: ID,
-        active: bool,
-    ) -> Result<bool> {
-        ctx.locator
-            .repository()
-            .third_party()
-            .update_repository_active(id, active)
-            .await?;
-        Ok(true)
+    /// Trigger a job run given its param string.
+    async fn trigger_job_run(ctx: &Context, command: String) -> Result<ID> {
+        check_admin(ctx).await?;
+        ctx.locator.job().trigger(command).await
     }
 
-    async fn create_gitlab_repository_provider(
-        ctx: &Context,
-        input: repository::CreateRepositoryProviderInput,
-    ) -> Result<ID> {
-        check_admin(ctx).await?;
+    async fn create_web_crawler_url(ctx: &Context, input: CreateWebCrawlerUrlInput) -> Result<ID> {
         input.validate()?;
         let id = ctx
             .locator
-            .integration()
-            .create_integration(
-                IntegrationKind::Gitlab,
-                input.display_name,
-                input.access_token,
-                None,
-            )
+            .web_crawler()
+            .create_web_crawler_url(input.url)
             .await?;
         Ok(id)
     }
 
-    async fn create_gitlab_self_hosted_repository_provider(
-        ctx: &Context,
-        input: repository::CreateSelfHostedRepositoryProviderInput,
-    ) -> Result<ID> {
-        check_admin(ctx).await?;
-        input.validate()?;
-        let id = ctx
-            .locator
-            .integration()
-            .create_integration(
-                IntegrationKind::Gitlab,
-                input.display_name,
-                input.access_token,
-                input.api_base,
-            )
-            .await?;
-        Ok(id)
-    }
-
-    async fn delete_gitlab_repository_provider(ctx: &Context, id: ID) -> Result<bool> {
-        check_admin(ctx).await?;
-        ctx.locator
-            .integration()
-            .delete_integration(id, IntegrationKind::Gitlab)
-            .await?;
-        Ok(true)
-    }
-
-    async fn delete_gitlab_self_hosted_repository_provider(ctx: &Context, id: ID) -> Result<bool> {
-        check_admin(ctx).await?;
-        ctx.locator
-            .integration()
-            .delete_integration(id, IntegrationKind::GitlabSelfHosted)
-            .await?;
-        Ok(true)
-    }
-
-    async fn update_gitlab_self_hosted_repository_provider(
-        ctx: &Context,
-        input: repository::UpdateSelfHostedRepositoryProviderInput,
-    ) -> Result<bool> {
-        check_admin(ctx).await?;
-        input.validate()?;
-        ctx.locator
-            .integration()
-            .update_integration(
-                input.id,
-                IntegrationKind::Gitlab,
-                input.display_name,
-                input.access_token,
-                input.api_base,
-            )
-            .await?;
-        Ok(true)
-    }
-
-    async fn update_gitlab_repository_provider(
-        ctx: &Context,
-        input: repository::UpdateRepositoryProviderInput,
-    ) -> Result<bool> {
-        check_admin(ctx).await?;
-        input.validate()?;
-        ctx.locator
-            .integration()
-            .update_integration(
-                input.id,
-                IntegrationKind::Gitlab,
-                input.display_name,
-                input.access_token,
-                None,
-            )
-            .await?;
-        Ok(true)
-    }
-
-    async fn update_gitlab_provided_repository_active(
-        ctx: &Context,
-        id: ID,
-        active: bool,
-    ) -> Result<bool> {
-        ctx.locator
-            .repository()
-            .third_party()
-            .update_repository_active(id, active)
-            .await?;
-        Ok(true)
-    }
-
-    async fn update_gitlab_self_hosted_provided_repository_active(
-        ctx: &Context,
-        id: ID,
-        active: bool,
-    ) -> Result<bool> {
-        ctx.locator
-            .repository()
-            .third_party()
-            .update_repository_active(id, active)
-            .await?;
+    async fn delete_web_crawler_url(ctx: &Context, id: ID) -> Result<bool> {
+        ctx.locator.web_crawler().delete_web_crawler_url(id).await?;
         Ok(true)
     }
 }

@@ -1,111 +1,152 @@
 mod db;
+mod git;
 mod helper;
-mod scheduler;
+mod index_garbage_collection;
 mod third_party_integration;
+mod web_crawler;
 
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
-use apalis::{
-    prelude::{Monitor, Storage},
-    sqlite::{SqlitePool, SqliteStorage},
-};
+use cron::Schedule;
+use futures::StreamExt;
+use git::SchedulerGitJob;
+use helper::{CronStream, Job, JobLogger};
+use index_garbage_collection::IndexGarbageCollection;
 use juniper::ID;
-use tabby_common::config::{RepositoryAccess, RepositoryConfig};
+use serde::{Deserialize, Serialize};
+use tabby_common::config::RepositoryConfig;
 use tabby_db::DbConn;
-use tabby_schema::{integration::IntegrationService, repository::ThirdPartyRepositoryService};
-
-use self::{
-    db::DbMaintainanceJob, scheduler::SchedulerJob, third_party_integration::SyncIntegrationJob,
+use tabby_inference::Embedding;
+use tabby_schema::{
+    integration::IntegrationService,
+    job::JobService,
+    repository::{GitRepositoryService, RepositoryService, ThirdPartyRepositoryService},
+    web_crawler::WebCrawlerService,
 };
-use crate::path::job_db_file;
+use third_party_integration::SchedulerGithubGitlabJob;
+use tracing::{debug, warn};
+use web_crawler::WebCrawlerJob;
 
+use self::{db::DbMaintainanceJob, third_party_integration::SyncIntegrationJob};
+
+#[derive(Debug, Serialize, Deserialize)]
 pub enum BackgroundJobEvent {
-    Scheduler(RepositoryConfig),
+    SchedulerGitRepository(RepositoryConfig),
+    SchedulerGithubGitlabRepository(ID),
     SyncThirdPartyRepositories(ID),
+    WebCrawler(String, String),
+    IndexGarbageCollection,
 }
 
-struct BackgroundJobImpl {
-    scheduler: SqliteStorage<SchedulerJob>,
-    third_party_repository: SqliteStorage<SyncIntegrationJob>,
+impl BackgroundJobEvent {
+    pub fn name(&self) -> &'static str {
+        match self {
+            BackgroundJobEvent::SchedulerGitRepository(_) => SchedulerGitJob::NAME,
+            BackgroundJobEvent::SchedulerGithubGitlabRepository(_) => {
+                SchedulerGithubGitlabJob::NAME
+            }
+            BackgroundJobEvent::SyncThirdPartyRepositories(_) => SyncIntegrationJob::NAME,
+            BackgroundJobEvent::WebCrawler(_, _) => WebCrawlerJob::NAME,
+            BackgroundJobEvent::IndexGarbageCollection => IndexGarbageCollection::NAME,
+        }
+    }
+
+    pub fn to_command(&self) -> String {
+        serde_json::to_string(self).expect("Failed to serialize background job event")
+    }
 }
 
 pub async fn start(
     db: DbConn,
-    repository_access: Arc<dyn RepositoryAccess>,
+    job_service: Arc<dyn JobService>,
+    git_repository_service: Arc<dyn GitRepositoryService>,
     third_party_repository_service: Arc<dyn ThirdPartyRepositoryService>,
     integration_service: Arc<dyn IntegrationService>,
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<BackgroundJobEvent>,
+    repository_service: Arc<dyn RepositoryService>,
+    web_crawler_service: Arc<dyn WebCrawlerService>,
+    embedding: Arc<dyn Embedding>,
 ) {
-    let path = format!("sqlite://{}?mode=rwc", job_db_file().display());
-    let pool = SqlitePool::connect(&path)
-        .await
-        .expect("unable to create sqlite pool");
-    SqliteStorage::setup(&pool)
-        .await
-        .expect("unable to run migrations for sqlite");
-
-    let monitor = Monitor::new();
-    let monitor = DbMaintainanceJob::register(monitor, db.clone());
-    let (scheduler, monitor) =
-        SchedulerJob::register(monitor, pool.clone(), db.clone(), repository_access);
-    let (third_party_repository, monitor) = SyncIntegrationJob::register(
-        monitor,
-        pool.clone(),
-        db.clone(),
-        third_party_repository_service,
-        integration_service,
-    );
+    let mut hourly =
+        CronStream::new(Schedule::from_str("@hourly").expect("Invalid cron expression"))
+            .into_stream();
 
     tokio::spawn(async move {
-        monitor.run().await.expect("failed to start worker");
-    });
+        loop {
+            tokio::select! {
+                job = db.get_next_job_to_execute() => {
+                    let Some(job) = job else {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    };
 
-    tokio::spawn(async move {
-        let mut background_job = BackgroundJobImpl {
-            scheduler,
-            third_party_repository,
-        };
+                    if let Err(err) = db.update_job_started(job.id).await {
+                        warn!("Failed to mark job status to started: {:?}", err);
+                        continue;
+                    }
 
-        while let Some(event) = receiver.recv().await {
-            background_job.on_event_publish(event).await;
+                    let logger = JobLogger::new(db.clone(), job.id);
+                    debug!("Background job {} started, command: {}", job.id, job.command);
+                    let Ok(event) = serde_json::from_str::<BackgroundJobEvent>(&job.command) else {
+                        logkit::info!(exit_code = -1; "Failed to parse background job event, marking it as failed");
+                        continue;
+                    };
+
+                    if let Err(err) = match event {
+                        BackgroundJobEvent::SchedulerGitRepository(repository_config) => {
+                            let job = SchedulerGitJob::new(repository_config);
+                            job.run(embedding.clone()).await
+                        },
+                        BackgroundJobEvent::SyncThirdPartyRepositories(integration_id) => {
+                            let job = SyncIntegrationJob::new(integration_id);
+                            job.run(third_party_repository_service.clone()).await
+                        }
+                        BackgroundJobEvent::SchedulerGithubGitlabRepository(integration_id) => {
+                            let job = SchedulerGithubGitlabJob::new(integration_id);
+                            job.run(embedding.clone(), third_party_repository_service.clone(), integration_service.clone()).await
+                        }
+                        BackgroundJobEvent::WebCrawler(source_id, url) => {
+                            let job = WebCrawlerJob::new(source_id, url);
+                            job.run(embedding.clone()).await
+                        }
+                        BackgroundJobEvent::IndexGarbageCollection => {
+                            let job = IndexGarbageCollection;
+                            job.run(repository_service.clone(), web_crawler_service.clone()).await
+                        }
+                    } {
+                        logkit::info!(exit_code = 1; "Job failed {}", err);
+                    } else {
+                        logkit::info!(exit_code = 0; "Job completed successfully");
+                    }
+                    logger.finalize().await;
+                    debug!("Background job {} completed", job.id);
+                },
+                Some(now) = hourly.next() => {
+                    if let Err(err) = DbMaintainanceJob::cron(now, db.clone()).await {
+                        warn!("Database maintainance failed: {:?}", err);
+                    }
+
+                    if let Err(err) = SchedulerGitJob::cron(now, git_repository_service.clone(), job_service.clone()).await {
+                        warn!("Scheduler job failed: {:?}", err);
+                    }
+
+                    if let Err(err) = SyncIntegrationJob::cron(now, integration_service.clone(), job_service.clone()).await {
+                        warn!("Sync integration job failed: {:?}", err);
+                    }
+
+                    if let Err(err) = SchedulerGithubGitlabJob::cron(now, third_party_repository_service.clone(), job_service.clone()).await {
+                        warn!("Index issues job failed: {err:?}");
+                    }
+
+                    if let Err(err) = IndexGarbageCollection.run(repository_service.clone(), web_crawler_service.clone()).await {
+                        warn!("Index garbage collection job failed: {err:?}");
+                    }
+
+                },
+                else => {
+                    warn!("Background job channel closed");
+                    break;
+                }
+            };
         }
     });
 }
-
-impl BackgroundJobImpl {
-    async fn trigger_scheduler(&self, repository: RepositoryConfig) {
-        self.scheduler
-            .clone()
-            .push(SchedulerJob::new(repository))
-            .await
-            .expect("unable to push job");
-    }
-
-    async fn trigger_sync_integration(&self, provider_id: ID) {
-        self.third_party_repository
-            .clone()
-            .push(SyncIntegrationJob::new(provider_id))
-            .await
-            .expect("Unable to push job");
-    }
-
-    async fn on_event_publish(&mut self, event: BackgroundJobEvent) {
-        match event {
-            BackgroundJobEvent::Scheduler(repository) => self.trigger_scheduler(repository).await,
-            BackgroundJobEvent::SyncThirdPartyRepositories(integration_id) => {
-                self.trigger_sync_integration(integration_id).await
-            }
-        }
-    }
-}
-
-macro_rules! cprintln {
-    ($ctx:expr, $($params:tt)+) => {
-        {
-            tracing::debug!($($params)+);
-            $ctx.r#internal_println(format!($($params)+)).await;
-        }
-    }
-}
-
-use cprintln;

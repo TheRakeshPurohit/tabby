@@ -9,12 +9,11 @@ use tabby_common::config::RepositoryConfig;
 use tabby_db::{DbConn, ProvidedRepositoryDAO};
 use tabby_schema::{
     integration::{Integration, IntegrationKind, IntegrationService},
+    job::{JobInfo, JobService},
     repository::{ProvidedRepository, Repository, RepositoryProvider, ThirdPartyRepositoryService},
     AsID, AsRowid, DbEnum, Result,
 };
-use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error};
-use url::Url;
 
 use self::fetch::RepositoryInfo;
 use super::to_repository;
@@ -25,18 +24,18 @@ mod fetch;
 struct ThirdPartyRepositoryServiceImpl {
     db: DbConn,
     integration: Arc<dyn IntegrationService>,
-    background_job: UnboundedSender<BackgroundJobEvent>,
+    job: Arc<dyn JobService>,
 }
 
 pub fn create(
     db: DbConn,
     integration: Arc<dyn IntegrationService>,
-    background_job: UnboundedSender<BackgroundJobEvent>,
+    job: Arc<dyn JobService>,
 ) -> impl ThirdPartyRepositoryService {
     ThirdPartyRepositoryServiceImpl {
         db,
         integration,
-        background_job,
+        job,
     }
 }
 
@@ -48,7 +47,7 @@ impl RepositoryProvider for ThirdPartyRepositoryServiceImpl {
             let repos_for_kind = ThirdPartyRepositoryService::list_repositories_with_filter(
                 self,
                 None,
-                None,
+                Some(kind.clone()),
                 Some(true),
                 None,
                 None,
@@ -99,18 +98,31 @@ impl ThirdPartyRepositoryService for ThirdPartyRepositoryServiceImpl {
 
         let kind = kind.map(|kind| kind.as_enum_str().to_string());
 
-        Ok(self
+        let repositories = self
             .db
             .list_provided_repositories(integration_ids, kind, active, limit, skip_id, backwards)
-            .await?
-            .into_iter()
-            .map(to_provided_repository)
-            .collect())
+            .await?;
+
+        let mut converted_repositories = vec![];
+
+        for repository in repositories {
+            let event =
+                BackgroundJobEvent::SchedulerGithubGitlabRepository(repository.id.as_id().clone());
+            let job_info = self.job.get_job_info(event.to_command()).await?;
+
+            converted_repositories.push(to_provided_repository(repository, job_info));
+        }
+
+        Ok(converted_repositories)
     }
 
     async fn get_provided_repository(&self, id: ID) -> Result<ProvidedRepository> {
         let repo = self.db.get_provided_repository(id.as_rowid()?).await?;
-        Ok(to_provided_repository(repo))
+
+        let event = BackgroundJobEvent::SchedulerGithubGitlabRepository(id);
+        let last_job_run = self.job.get_job_info(event.to_command()).await?;
+
+        Ok(to_provided_repository(repo, last_job_run))
     }
 
     async fn update_repository_active(&self, id: ID, active: bool) -> Result<()> {
@@ -119,21 +131,15 @@ impl ThirdPartyRepositoryService for ThirdPartyRepositoryServiceImpl {
             .await?;
 
         if active {
-            let repo = ThirdPartyRepositoryService::get_provided_repository(self, id).await?;
-            let integration = self
-                .integration
-                .get_integration(repo.integration_id.clone())
-                .await?;
-            let git_url = format_authenticated_url(
-                &integration.kind,
-                &repo.git_url,
-                &integration.access_token,
-            )?;
             let _ = self
-                .background_job
-                .send(BackgroundJobEvent::Scheduler(RepositoryConfig::new(
-                    git_url,
-                )));
+                .job
+                .trigger(BackgroundJobEvent::SchedulerGithubGitlabRepository(id).to_command())
+                .await;
+        } else {
+            let _ = self
+                .job
+                .trigger(BackgroundJobEvent::IndexGarbageCollection.to_command())
+                .await;
         }
 
         Ok(())
@@ -154,18 +160,14 @@ impl ThirdPartyRepositoryService for ThirdPartyRepositoryServiceImpl {
         .await
         {
             Ok(repos) => repos,
-            Err((e, true)) => {
+            Err(e) => {
                 self.integration
                     .update_integration_sync_status(provider.id.clone(), Some(e.to_string()))
                     .await?;
                 error!(
-                    "Credentials for integration {} are expired or invalid",
+                    "Failed to fetch repositories from integration: {}",
                     provider.display_name
                 );
-                return Err(e.into());
-            }
-            Err((e, false)) => {
-                error!("Failed to fetch repositories from github: {e}");
                 return Err(e.into());
             }
         };
@@ -180,8 +182,9 @@ impl ThirdPartyRepositoryService for ThirdPartyRepositoryServiceImpl {
         vendor_id: String,
         display_name: String,
         git_url: String,
-    ) -> Result<()> {
-        self.db
+    ) -> Result<ID> {
+        let id = self
+            .db
             .upsert_provided_repository(
                 integration_id.as_rowid()?,
                 vendor_id,
@@ -189,7 +192,7 @@ impl ThirdPartyRepositoryService for ThirdPartyRepositoryServiceImpl {
                 git_url,
             )
             .await?;
-        Ok(())
+        Ok(id.as_id())
     }
 
     async fn delete_outdated_repositories(
@@ -197,10 +200,16 @@ impl ThirdPartyRepositoryService for ThirdPartyRepositoryServiceImpl {
         integration_id: ID,
         before: DateTime<Utc>,
     ) -> Result<usize> {
-        Ok(self
+        let usize = self
             .db
             .delete_outdated_provided_repositories(integration_id.as_rowid()?, before.into())
-            .await?)
+            .await?;
+
+        self.job
+            .trigger(BackgroundJobEvent::IndexGarbageCollection.to_command())
+            .await?;
+
+        Ok(usize)
     }
 
     async fn list_repository_configs(&self) -> Result<Vec<RepositoryConfig>> {
@@ -225,11 +234,9 @@ impl ThirdPartyRepositoryService for ThirdPartyRepositoryServiceImpl {
             .await?;
 
             for repository in repositories {
-                let url = format_authenticated_url(
-                    &integration.kind,
-                    &repository.git_url,
-                    &integration.access_token,
-                )?;
+                let url = integration
+                    .kind
+                    .format_authenticated_url(&repository.git_url, &integration.access_token)?;
                 urls.push(RepositoryConfig::new(url));
             }
         }
@@ -266,27 +273,10 @@ async fn refresh_repositories_for_provider(
     Ok(())
 }
 
-fn format_authenticated_url(
-    kind: &IntegrationKind,
-    git_url: &str,
-    access_token: &str,
-) -> Result<String> {
-    let mut url = Url::parse(git_url).map_err(anyhow::Error::from)?;
-    match kind {
-        IntegrationKind::Github | IntegrationKind::GithubSelfHosted => {
-            let _ = url.set_username(access_token);
-        }
-        IntegrationKind::Gitlab | IntegrationKind::GitlabSelfHosted => {
-            let _ = url.set_username("oauth2");
-            let _ = url.set_password(Some(access_token));
-        }
-    }
-    Ok(url.to_string())
-}
-
-fn to_provided_repository(value: ProvidedRepositoryDAO) -> ProvidedRepository {
+fn to_provided_repository(value: ProvidedRepositoryDAO, job_info: JobInfo) -> ProvidedRepository {
+    let id = value.id.as_id();
     ProvidedRepository {
-        id: value.id.as_id(),
+        id: id.clone(),
         integration_id: value.integration_id.as_id(),
         active: value.active,
         display_name: value.name,
@@ -296,6 +286,7 @@ fn to_provided_repository(value: ProvidedRepositoryDAO) -> ProvidedRepository {
         refs: tabby_git::list_refs(&RepositoryConfig::new(&value.git_url).dir())
             .unwrap_or_default(),
         git_url: value.git_url,
+        job_info,
     }
 }
 
@@ -304,16 +295,18 @@ mod tests {
 
     use std::time::Duration;
 
+    use tabby_schema::repository::RepositoryKind;
+
     use super::*;
 
     async fn create_fake() -> (
         Arc<dyn ThirdPartyRepositoryService>,
         Arc<dyn IntegrationService>,
     ) {
-        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
         let db = DbConn::new_in_memory().await.unwrap();
-        let integration = Arc::new(crate::integration::create(db.clone(), sender.clone()));
-        let repository = Arc::new(create(db.clone(), integration.clone(), sender.clone()));
+        let job = Arc::new(crate::service::job::create(db.clone()).await);
+        let integration = Arc::new(crate::integration::create(db.clone(), job.clone()));
+        let repository = Arc::new(create(db.clone(), integration.clone(), job));
         (repository, integration)
     }
 
@@ -588,5 +581,95 @@ mod tests {
             repos.iter().map(|r| &r.display_name).collect::<Vec<_>>(),
             vec!["TabbyML/tabby2", "TabbyML/newrepo"]
         );
+    }
+
+    #[tokio::test]
+    async fn test_repository_list() {
+        let (repository, integration) = create_fake().await;
+
+        let integration_id1 = integration
+            .create_integration(
+                IntegrationKind::Github,
+                "github".into(),
+                "token".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let integration_id2 = integration
+            .create_integration(
+                IntegrationKind::GithubSelfHosted,
+                "github-sh".into(),
+                "token".into(),
+                Some("https://my.github.com".into()),
+            )
+            .await
+            .unwrap();
+
+        let repo_id1 = repository
+            .upsert_repository(
+                integration_id1.clone(),
+                "id1".into(),
+                "repo1".into(),
+                "https://github.com/test/repo1".into(),
+            )
+            .await
+            .unwrap();
+
+        repository
+            .update_repository_active(repo_id1, true)
+            .await
+            .unwrap();
+
+        let repo_id2 = repository
+            .upsert_repository(
+                integration_id2.clone(),
+                "id2".into(),
+                "repo2".into(),
+                "https://my.github.com/test/repo2".into(),
+            )
+            .await
+            .unwrap();
+
+        repository
+            .update_repository_active(repo_id2, true)
+            .await
+            .unwrap();
+
+        let repos = repository.repository_list().await.unwrap();
+        assert_eq!(repos.len(), 2);
+
+        assert_eq!(repos[0].name, "repo1");
+        assert_eq!(repos[0].kind, RepositoryKind::Github);
+        assert_eq!(repos[0].git_url, "https://github.com/test/repo1");
+
+        assert_eq!(repos[1].name, "repo2");
+        assert_eq!(repos[1].kind, RepositoryKind::GithubSelfHosted);
+        assert_eq!(repos[1].git_url, "https://my.github.com/test/repo2");
+    }
+
+    #[tokio::test]
+    async fn test_get_repository() {
+        let (repository, integration) = create_fake().await;
+        let provider_id = integration
+            .create_integration(IntegrationKind::Github, "gh".into(), "token".into(), None)
+            .await
+            .unwrap();
+
+        let repo_id = repository
+            .upsert_repository(
+                provider_id,
+                "vendor_id".into(),
+                "name".into(),
+                "https://github.com/TabbyML/tabby".into(),
+            )
+            .await
+            .unwrap();
+
+        let repo = repository.get_repository(&repo_id).await.unwrap();
+        assert_eq!(repo.kind, RepositoryKind::Github);
+        assert_eq!(repo.name, "name");
+        assert_eq!(repo.git_url, "https://github.com/TabbyML/tabby");
     }
 }

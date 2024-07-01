@@ -4,11 +4,12 @@ pub mod background_job;
 mod email;
 pub mod event_logger;
 pub mod integration;
-mod job;
+pub mod job;
 mod license;
 pub mod repository;
 mod setting;
 mod user_event;
+pub mod web_crawler;
 
 use std::sync::Arc;
 
@@ -37,6 +38,7 @@ use tabby_schema::{
     repository::RepositoryService,
     setting::SettingService,
     user_event::UserEventService,
+    web_crawler::WebCrawlerService,
     worker::WorkerService,
     AsID, AsRowid, CoreError, Result, ServiceLocator,
 };
@@ -53,6 +55,7 @@ struct ServerContext {
     integration: Arc<dyn IntegrationService>,
     user_event: Arc<dyn UserEventService>,
     job: Arc<dyn JobService>,
+    web_crawler: Arc<dyn WebCrawlerService>,
 
     logger: Arc<dyn EventLogger>,
     code: Arc<dyn CodeSearch>,
@@ -68,6 +71,8 @@ impl ServerContext {
         code: Arc<dyn CodeSearch>,
         repository: Arc<dyn RepositoryService>,
         integration: Arc<dyn IntegrationService>,
+        web_crawler: Arc<dyn WebCrawlerService>,
+        job: Arc<dyn JobService>,
         db_conn: DbConn,
         is_chat_enabled_locally: bool,
     ) -> Self {
@@ -82,8 +87,8 @@ impl ServerContext {
                 .expect("failed to initialize license service"),
         );
         let user_event = Arc::new(user_event::create(db_conn.clone()));
-        let job = Arc::new(job::create(db_conn.clone()).await);
         let setting = Arc::new(setting::create(db_conn.clone()));
+
         Self {
             mail: mail.clone(),
             auth: Arc::new(auth::create(
@@ -92,6 +97,7 @@ impl ServerContext {
                 license.clone(),
                 setting.clone(),
             )),
+            web_crawler,
             license,
             repository,
             integration,
@@ -241,6 +247,10 @@ impl ServiceLocator for ArcServerContext {
     fn integration(&self) -> Arc<dyn IntegrationService> {
         self.0.integration.clone()
     }
+
+    fn web_crawler(&self) -> Arc<dyn WebCrawlerService> {
+        self.0.web_crawler.clone()
+    }
 }
 
 pub async fn create_service_locator(
@@ -248,11 +258,23 @@ pub async fn create_service_locator(
     code: Arc<dyn CodeSearch>,
     repository: Arc<dyn RepositoryService>,
     integration: Arc<dyn IntegrationService>,
+    web_crawler: Arc<dyn WebCrawlerService>,
+    job: Arc<dyn JobService>,
     db: DbConn,
     is_chat_enabled: bool,
 ) -> Arc<dyn ServiceLocator> {
     Arc::new(ArcServerContext::new(
-        ServerContext::new(logger, code, repository, integration, db, is_chat_enabled).await,
+        ServerContext::new(
+            logger,
+            code,
+            repository,
+            integration,
+            web_crawler,
+            job,
+            db,
+            is_chat_enabled,
+        )
+        .await,
     ))
 }
 
@@ -280,4 +302,17 @@ pub fn graphql_pagination_to_filter(
         }
         _ => Ok((None, None, false)),
     }
+}
+
+pub async fn create_gitlab_client(
+    api_base: &str,
+    access_token: &str,
+) -> Result<gitlab::AsyncGitlab, anyhow::Error> {
+    let url = url::Url::parse(api_base)?;
+    let api_base = url.authority();
+    let mut builder = gitlab::Gitlab::builder(api_base.to_owned(), access_token);
+    if url.scheme() == "http" {
+        builder.insecure();
+    };
+    Ok(builder.build_async().await?)
 }

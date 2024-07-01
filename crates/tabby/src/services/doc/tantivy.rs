@@ -1,101 +1,121 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use tabby_common::{
     api::doc::{DocSearch, DocSearchDocument, DocSearchError, DocSearchHit, DocSearchResponse},
-    index::{self},
-    path,
+    index::{self, corpus, doc},
 };
 use tabby_inference::Embedding;
 use tantivy::{
     collector::TopDocs,
+    query::{BooleanQuery, ConstScoreQuery, Occur},
     schema::{self, Value},
-    Index, IndexReader, TantivyDocument,
+    IndexReader, TantivyDocument,
 };
-use tokio::{sync::RwLock, time::sleep};
-use tracing::{debug, warn};
+use tracing::warn;
+
+use crate::services::tantivy::IndexReaderProvider;
 
 struct DocSearchImpl {
-    reader: IndexReader,
     embedding: Arc<dyn Embedding>,
 }
 
+const EMBEDDING_SCORE_THRESHOLD: f32 = 0.75;
+
 impl DocSearchImpl {
-    fn load(embedding: Arc<dyn Embedding>) -> Result<Self> {
-        let index = Index::open_in_dir(path::doc_index_dir())?;
-
-        Ok(Self {
-            reader: index.reader_builder().try_into()?,
-            embedding,
-        })
+    fn new(embedding: Arc<dyn Embedding>) -> Self {
+        Self { embedding }
     }
 
-    async fn load_async(embedding: Arc<dyn Embedding>) -> DocSearchImpl {
-        loop {
-            match Self::load(embedding.clone()) {
-                Ok(doc) => {
-                    debug!("Index is ready, enabling doc search...");
-                    return doc;
-                }
-                Err(err) => {
-                    debug!("Doc index is not ready `{}`", err);
-                }
-            };
-
-            sleep(Duration::from_secs(60)).await;
-        }
-    }
-}
-
-#[async_trait]
-impl DocSearch for DocSearchImpl {
     async fn search(
         &self,
+        reader: &IndexReader,
         q: &str,
         limit: usize,
-        offset: usize,
     ) -> Result<DocSearchResponse, DocSearchError> {
-        let schema = index::DocSearchSchema::instance();
+        let schema = index::IndexSchema::instance();
         let embedding = self.embedding.embed(q).await?;
         let embedding_tokens_query =
-            schema.embedding_tokens_query(embedding.len(), embedding.iter());
+            index::embedding_tokens_query(embedding.len(), embedding.iter());
+        let corpus_query = schema.corpus_query(corpus::WEB);
+        let query = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(ConstScoreQuery::new(corpus_query, 0.0)),
+            ),
+            (Occur::Must, Box::new(embedding_tokens_query)),
+        ]);
 
-        let searcher = self.reader.searcher();
-        let top_chunks = searcher.search(
-            &embedding_tokens_query,
-            &TopDocs::with_limit(limit).and_offset(offset),
-        )?;
+        let searcher = reader.searcher();
+        let top_chunks = searcher.search(&query, &TopDocs::with_limit(limit * 2))?;
 
-        let hits = top_chunks
-            .iter()
-            .filter_map(|(score, chunk_address)| {
-                let chunk: TantivyDocument = searcher.doc(*chunk_address).ok()?;
-                let doc_id = get_text(&chunk, schema.field_id);
-                let chunk_text = get_text(&chunk, schema.field_chunk_text);
-
-                let doc_query = schema.doc_query(doc_id);
-                let top_docs = match searcher.search(&doc_query, &TopDocs::with_limit(1)) {
-                    Err(err) => {
-                        warn!("Failed to search doc `{}`: `{}`", doc_id, err);
-                        return None;
-                    }
-                    Ok(top_docs) => top_docs,
-                };
-                let (_, doc_address) = top_docs.first()?;
-                let doc: TantivyDocument = searcher.doc(*doc_address).ok()?;
-                let title = get_text(&doc, schema.field_title);
-                let link = get_text(&doc, schema.field_link);
-
-                Some(DocSearchHit {
-                    doc: DocSearchDocument {
-                        title: title.to_string(),
-                        link: link.to_string(),
-                        snippet: chunk_text.to_string(),
-                    },
-                    score: *score,
+        let chunks = {
+            // Extract all chunks.
+            let mut chunks: Vec<_> = top_chunks
+                .iter()
+                .filter_map(|(score, chunk_address)| {
+                    let chunk: TantivyDocument = searcher.doc(*chunk_address).ok()?;
+                    let doc_id = get_text(&chunk, schema.field_id).to_owned();
+                    Some(ScoredChunk {
+                        score: *score,
+                        chunk,
+                        doc_id,
+                    })
                 })
-            })
+                .collect();
+
+            // Sort by score in descending order.
+            chunks.sort_unstable_by(|lhs, rhs| rhs.score.total_cmp(&lhs.score));
+
+            // Deduplicate by doc_id.
+            let mut doc_ids = HashSet::new();
+            chunks.retain(|x| doc_ids.insert(x.doc_id.clone()));
+
+            chunks
+        };
+
+        let hits = chunks
+            .iter()
+            .filter_map(
+                |ScoredChunk {
+                     doc_id,
+                     score,
+                     chunk,
+                 }| {
+                    let chunk_text = get_json_text_field(
+                        chunk,
+                        schema.field_chunk_attributes,
+                        doc::fields::CHUNK_TEXT,
+                    );
+
+                    let doc_query = schema.doc_query(corpus::WEB, doc_id);
+                    let top_docs = match searcher.search(&doc_query, &TopDocs::with_limit(1)) {
+                        Err(err) => {
+                            warn!("Failed to search doc `{}`: `{}`", doc_id, err);
+                            return None;
+                        }
+                        Ok(top_docs) => top_docs,
+                    };
+                    let (_, doc_address) = top_docs.first()?;
+                    let doc: TantivyDocument = searcher.doc(*doc_address).ok()?;
+                    let title =
+                        get_json_text_field(&doc, schema.field_attributes, doc::fields::TITLE);
+                    let link =
+                        get_json_text_field(&doc, schema.field_attributes, doc::fields::LINK);
+
+                    Some(DocSearchHit {
+                        doc: DocSearchDocument {
+                            title: title.to_string(),
+                            link: link.to_string(),
+                            snippet: chunk_text.to_string(),
+                        },
+                        score: *score,
+                    })
+                },
+            )
+            .filter(|x| x.score >= EMBEDDING_SCORE_THRESHOLD)
+            .take(limit)
             .collect();
 
         Ok(DocSearchResponse { hits })
@@ -106,45 +126,43 @@ fn get_text(doc: &TantivyDocument, field: schema::Field) -> &str {
     doc.get_first(field).unwrap().as_str().unwrap()
 }
 
-pub struct DocSearchService {
-    search: Arc<RwLock<Option<DocSearchImpl>>>,
-    loader: tokio::task::JoinHandle<()>,
+fn get_json_text_field<'a>(doc: &'a TantivyDocument, field: schema::Field, name: &str) -> &'a str {
+    doc.get_first(field)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .find(|(k, _)| *k == name)
+        .unwrap()
+        .1
+        .as_str()
+        .unwrap()
 }
 
-impl Drop for DocSearchService {
-    fn drop(&mut self) {
-        if !self.loader.is_finished() {
-            self.loader.abort();
-        }
-    }
+struct ScoredChunk {
+    doc_id: String,
+    score: f32,
+    chunk: TantivyDocument,
+}
+
+pub struct DocSearchService {
+    imp: DocSearchImpl,
+    provider: Arc<IndexReaderProvider>,
 }
 
 impl DocSearchService {
-    pub fn new(embedding: Arc<dyn Embedding>) -> Self {
-        let search = Arc::new(RwLock::new(None));
-        let cloned_search = search.clone();
-        let loader = tokio::spawn(async move {
-            let doc = DocSearchImpl::load_async(embedding).await;
-            *cloned_search.write().await = Some(doc);
-        });
-
+    pub fn new(embedding: Arc<dyn Embedding>, provider: Arc<IndexReaderProvider>) -> Self {
         Self {
-            search: search.clone(),
-            loader,
+            imp: DocSearchImpl::new(embedding),
+            provider,
         }
     }
 }
 
 #[async_trait]
 impl DocSearch for DocSearchService {
-    async fn search(
-        &self,
-        q: &str,
-        limit: usize,
-        offset: usize,
-    ) -> Result<DocSearchResponse, DocSearchError> {
-        if let Some(imp) = self.search.read().await.as_ref() {
-            imp.search(q, limit, offset).await
+    async fn search(&self, q: &str, limit: usize) -> Result<DocSearchResponse, DocSearchError> {
+        if let Some(reader) = self.provider.reader().await.as_ref() {
+            self.imp.search(reader, q, limit).await
         } else {
             Err(DocSearchError::NotReady)
         }

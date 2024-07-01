@@ -1,25 +1,24 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use juniper::ID;
 use tabby_db::DbConn;
 use tabby_schema::{
     integration::{Integration, IntegrationKind, IntegrationService},
+    job::JobService,
     AsID, AsRowid, DbEnum, Result,
 };
-use tokio::sync::mpsc::UnboundedSender;
 
 use super::graphql_pagination_to_filter;
-use crate::service::background_job::BackgroundJobEvent;
+use crate::{bail, service::background_job::BackgroundJobEvent};
 
 struct IntegrationServiceImpl {
     db: DbConn,
-    background_job: UnboundedSender<BackgroundJobEvent>,
+    job: Arc<dyn JobService>,
 }
 
-pub fn create(
-    db: DbConn,
-    background_job: UnboundedSender<BackgroundJobEvent>,
-) -> impl IntegrationService {
-    IntegrationServiceImpl { db, background_job }
+pub fn create(db: DbConn, job: Arc<dyn JobService>) -> impl IntegrationService {
+    IntegrationServiceImpl { db, job }
 }
 
 #[async_trait]
@@ -31,6 +30,10 @@ impl IntegrationService for IntegrationServiceImpl {
         access_token: String,
         api_base: Option<String>,
     ) -> Result<ID> {
+        if kind.is_self_hosted() && api_base.is_none() {
+            bail!("Self-hosted integrations must specify an API base");
+        }
+
         let id = self
             .db
             .create_integration(
@@ -42,14 +45,18 @@ impl IntegrationService for IntegrationServiceImpl {
             .await?;
         let id = id.as_id();
         let _ = self
-            .background_job
-            .send(BackgroundJobEvent::SyncThirdPartyRepositories(id.clone()));
+            .job
+            .trigger(BackgroundJobEvent::SyncThirdPartyRepositories(id.clone()).to_command())
+            .await;
         Ok(id)
     }
 
     async fn delete_integration(&self, id: ID, kind: IntegrationKind) -> Result<()> {
         self.db
             .delete_integration(id.as_rowid()?, kind.as_enum_str())
+            .await?;
+        self.job
+            .trigger(BackgroundJobEvent::IndexGarbageCollection.to_command())
             .await?;
         Ok(())
     }
@@ -62,6 +69,16 @@ impl IntegrationService for IntegrationServiceImpl {
         access_token: Option<String>,
         api_base: Option<String>,
     ) -> Result<()> {
+        if kind.is_self_hosted() && api_base.is_none() {
+            bail!("Self-hosted integrations must specify an API base");
+        }
+
+        let integration = self.get_integration(id.clone()).await?;
+        let access_token_is_changed = access_token
+            .as_ref()
+            .is_some_and(|token| token != &integration.access_token);
+        let api_base_is_changed = integration.api_base != api_base;
+
         self.db
             .update_integration(
                 id.as_rowid()?,
@@ -71,6 +88,14 @@ impl IntegrationService for IntegrationServiceImpl {
                 api_base,
             )
             .await?;
+
+        if access_token_is_changed || api_base_is_changed {
+            let _ = self
+                .job
+                .trigger(BackgroundJobEvent::SyncThirdPartyRepositories(id.clone()).to_command())
+                .await;
+        }
+
         Ok(())
     }
 
@@ -120,18 +145,17 @@ mod tests {
     use tabby_schema::integration::IntegrationStatus;
 
     use super::*;
+    use crate::job;
 
-    fn create_fake() -> UnboundedSender<BackgroundJobEvent> {
-        let (sender, _) = tokio::sync::mpsc::unbounded_channel();
-        sender
+    async fn create_services() -> (Arc<dyn IntegrationService>, Arc<dyn JobService>, DbConn) {
+        let db = DbConn::new_in_memory().await.unwrap();
+        let job = Arc::new(job::create(db.clone()).await);
+        (Arc::new(create(db.clone(), job.clone())), job, db)
     }
 
     #[tokio::test]
     async fn test_integration_crud() {
-        let background = create_fake();
-        let db = DbConn::new_in_memory().await.unwrap();
-        let integration = Arc::new(create(db, background));
-
+        let (integration, _, _) = create_services().await;
         let id = integration
             .create_integration(IntegrationKind::Gitlab, "id".into(), "secret".into(), None)
             .await
@@ -200,5 +224,134 @@ mod tests {
                 .unwrap()
                 .len()
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_integration_should_reset_status() {
+        let (integration, _, db) = create_services().await;
+        let id = integration
+            .create_integration(IntegrationKind::Github, "gh".into(), "token".into(), None)
+            .await
+            .unwrap();
+
+        // Test event is sent to re-sync provider after provider is created
+        let job = db.get_next_job_to_execute().await.unwrap();
+        assert_eq!(
+            job.command,
+            BackgroundJobEvent::SyncThirdPartyRepositories(id.clone()).to_command()
+        );
+
+        // Test integration status is failed after updating sync status with an error
+        integration
+            .update_integration_sync_status(id.clone(), Some("error".into()))
+            .await
+            .unwrap();
+
+        let provider = integration.get_integration(id.clone()).await.unwrap();
+
+        assert_eq!(provider.status, IntegrationStatus::Failed);
+
+        // Test integration status is not changed if token has not been updated
+        integration
+            .update_integration(
+                id.clone(),
+                IntegrationKind::Github,
+                "gh".into(),
+                Some("token".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let provider = integration.get_integration(id.clone()).await.unwrap();
+
+        assert_eq!(provider.status, IntegrationStatus::Failed);
+
+        // Test integration status is pending after updating token
+        integration
+            .update_integration(
+                id.clone(),
+                IntegrationKind::Github,
+                "gh".into(),
+                Some("token2".into()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let provider = integration.get_integration(id.clone()).await.unwrap();
+
+        assert_eq!(provider.status, IntegrationStatus::Pending);
+
+        // Test integration status is ready after a successful sync and an update which changes no fields
+        integration
+            .update_integration_sync_status(id.clone(), None)
+            .await
+            .unwrap();
+        integration
+            .update_integration(id.clone(), IntegrationKind::Github, "gh".into(), None, None)
+            .await
+            .unwrap();
+
+        let provider = integration.get_integration(id.clone()).await.unwrap();
+
+        assert_eq!(provider.status, IntegrationStatus::Ready);
+
+        // Test event is sent to re-sync provider after credentials are updated
+        let job = db.get_next_job_to_execute().await.unwrap();
+        assert_eq!(
+            job.command,
+            BackgroundJobEvent::SyncThirdPartyRepositories(id.clone()).to_command()
+        );
+
+        // Test sync event is not sent if no fields are updated
+        integration
+            .update_integration(
+                id.clone(),
+                IntegrationKind::Github,
+                "gh".into(),
+                Some("token2".into()),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_api_base() {
+        let (integration, _, _) = create_services().await;
+
+        // Should not be able to create a self-hosted provider without an API base
+        assert!(integration
+            .create_integration(
+                IntegrationKind::GithubSelfHosted,
+                "github".into(),
+                "token".into(),
+                None
+            )
+            .await
+            .is_err());
+
+        // Should not be able to update an existing self-hosted provider without an API base
+        let id = integration
+            .create_integration(
+                IntegrationKind::GitlabSelfHosted,
+                "github".into(),
+                "token".into(),
+                Some("https://github.com".into()),
+            )
+            .await
+            .unwrap();
+
+        assert!(integration
+            .update_integration(
+                id,
+                IntegrationKind::GitlabSelfHosted,
+                "github".into(),
+                None,
+                None
+            )
+            .await
+            .is_err());
     }
 }

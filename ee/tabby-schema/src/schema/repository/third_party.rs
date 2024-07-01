@@ -4,7 +4,9 @@ use juniper::{GraphQLObject, ID};
 use tabby_common::config::RepositoryConfig;
 
 use super::RepositoryProvider;
-use crate::{integration::IntegrationKind, juniper::relay::NodeType, schema::Result, Context};
+use crate::{
+    integration::IntegrationKind, job::JobInfo, juniper::relay::NodeType, schema::Result, Context,
+};
 
 #[derive(GraphQLObject)]
 #[graphql(context = Context)]
@@ -18,6 +20,18 @@ pub struct ProvidedRepository {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub refs: Vec<String>,
+
+    pub job_info: JobInfo,
+}
+
+impl ProvidedRepository {
+    pub fn source_id(&self) -> String {
+        Self::format_source_id(&self.id)
+    }
+
+    pub fn format_source_id(id: &ID) -> String {
+        format!("provided_repository:{}", id)
+    }
 }
 
 impl NodeType for ProvidedRepository {
@@ -58,7 +72,7 @@ pub trait ThirdPartyRepositoryService: Send + Sync + RepositoryProvider {
         vendor_id: String,
         display_name: String,
         git_url: String,
-    ) -> Result<()>;
+    ) -> Result<ID>;
     async fn sync_repositories(&self, integration_id: ID) -> Result<()>;
     async fn delete_outdated_repositories(
         &self,

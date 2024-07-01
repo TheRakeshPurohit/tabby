@@ -1,18 +1,19 @@
 import React from 'react'
+import { find } from 'lodash-es'
 import type { Context } from 'tabby-chat-panel'
 import { useClient } from 'tabby-chat-panel/react'
 
+import { useLatest } from '@/lib/hooks/use-latest'
 import { useMe } from '@/lib/hooks/use-me'
-import useRouterStuff from '@/lib/hooks/use-router-stuff'
 import { useStore } from '@/lib/hooks/use-store'
 import { useChatStore } from '@/lib/stores/chat-store'
-import { UserMessage } from '@/lib/types'
-import { cn } from '@/lib/utils'
+import { cn, formatLineHashForCodeBrowser } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { IconClose } from '@/components/ui/icons'
 
 import { QuickActionEventPayload } from '../lib/event-emitter'
 import { SourceCodeBrowserContext } from './source-code-browser'
+import { generateEntryPath, getDefaultRepoRef, resolveRepoRef } from './utils'
 
 interface ChatSideBarProps
   extends Omit<React.HTMLAttributes<HTMLDivElement>, 'children'> {}
@@ -21,24 +22,61 @@ export const ChatSideBar: React.FC<ChatSideBarProps> = ({
   className,
   ...props
 }) => {
-  const { updateSearchParams } = useRouterStuff()
   const [{ data }] = useMe()
-  const { pendingEvent, setPendingEvent } = React.useContext(
-    SourceCodeBrowserContext
-  )
+  const {
+    pendingEvent,
+    setPendingEvent,
+    repoMap,
+    activeRepoRef,
+    updateActivePath
+  } = React.useContext(SourceCodeBrowserContext)
   const activeChatId = useStore(useChatStore, state => state.activeChatId)
   const iframeRef = React.useRef<HTMLIFrameElement>(null)
-  const client = useClient(iframeRef, {
-    navigate: (context: Context) => {
-      if (context?.filepath) {
-        updateSearchParams({
-          set: {
-            path: context.filepath,
-            line: String(context.range.start ?? '')
-          },
-          del: 'plain'
-        })
+  const repoMapRef = useLatest(repoMap)
+  const latestRepoRef = useLatest(activeRepoRef)
+  const onNavigate = async (context: Context) => {
+    if (context?.filepath && context?.git_url) {
+      const lineHash = formatLineHashForCodeBrowser(context?.range)
+      const repoMap = repoMapRef.current
+      const matchedRepositoryKey = find(
+        Object.keys(repoMap),
+        key => repoMap?.[key]?.gitUrl === context.git_url
+      )
+      if (matchedRepositoryKey) {
+        const targetRepo = repoMap[matchedRepositoryKey]
+        if (targetRepo) {
+          const defaultRef = getDefaultRepoRef(targetRepo.refs)
+          // use curernt rev, and use defaultRev as fallback
+          const refName =
+            latestRepoRef?.current?.name ||
+            resolveRepoRef(defaultRef ?? '')?.name
+          updateActivePath(
+            generateEntryPath(
+              targetRepo,
+              refName,
+              context.filepath,
+              context.kind
+            ),
+            {
+              hash: lineHash,
+              replace: false
+            }
+          )
+          return
+        }
       }
+    }
+  }
+
+  const client = useClient(iframeRef, {
+    navigate: onNavigate,
+    refresh: async () => {
+      window.location.reload()
+
+      // Ensure the loading effect is maintained
+      await new Promise(resolve => {
+        setTimeout(() => resolve(null), 1000)
+      })
     }
   })
 
@@ -62,29 +100,6 @@ export const ChatSideBar: React.FC<ChatSideBarProps> = ({
   }
 
   React.useEffect(() => {
-    const contentWindow = iframeRef.current?.contentWindow
-
-    if (pendingEvent) {
-      const { lineFrom, lineTo, code, path } = pendingEvent
-      contentWindow?.postMessage({
-        action: 'sendUserChat',
-        payload: {
-          message: getPrompt(pendingEvent),
-          selectContext: {
-            content: code,
-            range: {
-              start: lineFrom,
-              end: lineTo
-            },
-            filepath: path
-          }
-        } as UserMessage
-      })
-      setPendingEvent(undefined)
-    }
-  }, [pendingEvent, iframeRef.current?.contentWindow])
-
-  React.useEffect(() => {
     if (iframeRef?.current && data) {
       client?.init({
         fetcherOptions: {
@@ -96,7 +111,7 @@ export const ChatSideBar: React.FC<ChatSideBarProps> = ({
 
   React.useEffect(() => {
     if (pendingEvent && client) {
-      const { lineFrom, lineTo, code, path } = pendingEvent
+      const { lineFrom, lineTo, code, path, gitUrl } = pendingEvent
       client.sendMessage({
         message: getPrompt(pendingEvent),
         selectContext: {
@@ -106,7 +121,8 @@ export const ChatSideBar: React.FC<ChatSideBarProps> = ({
             start: lineFrom,
             end: lineTo ?? lineFrom
           },
-          filepath: path
+          filepath: path,
+          git_url: gitUrl
         }
       })
     }

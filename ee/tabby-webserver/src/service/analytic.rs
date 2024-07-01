@@ -74,9 +74,7 @@ impl AnalyticService for AnalyticServiceImpl {
     async fn disk_usage_stats(&self) -> Result<DiskUsageStats> {
         Ok(DiskUsageStats {
             events: dir_size(tabby_common::path::events_dir()).await?,
-            indexed_repositories: dir_size(tabby_common::path::index_dir())
-                .await?
-                .combine(dir_size(tabby_common::path::cache_dir()).await?),
+            indexed_repositories: dir_size(tabby_common::path::index_dir()).await?,
             database: dir_size(crate::path::tabby_ee_root()).await?,
             models: dir_size(tabby_common::path::models_dir()).await?,
         })
@@ -139,7 +137,7 @@ mod tests {
     async fn test_daily_stats_in_past_year() {
         let db = DbConn::new_in_memory().await.unwrap();
         let user_id = db
-            .create_user("test@example.com".into(), Some("pass".into()), true)
+            .create_user("test@example.com".into(), Some("pass".into()), true, None)
             .await
             .unwrap();
 
@@ -158,7 +156,7 @@ mod tests {
             .unwrap();
 
         let user_id2 = db
-            .create_user("test2@example.com".into(), Some("pass".into()), false)
+            .create_user("test2@example.com".into(), Some("pass".into()), false, None)
             .await
             .unwrap();
 
@@ -212,7 +210,7 @@ mod tests {
     async fn test_daily_stats() {
         let db = DbConn::new_in_memory().await.unwrap();
         let user_id = db
-            .create_user("test@example.com".into(), Some("pass".into()), true)
+            .create_user("test@example.com".into(), Some("pass".into()), true, None)
             .await
             .unwrap();
 
@@ -256,7 +254,7 @@ mod tests {
         let db = DbConn::new_in_memory().await.unwrap();
 
         let user_id = db
-            .create_user("test@example.com".into(), Some("pass".into()), true)
+            .create_user("test@example.com".into(), Some("pass".into()), true, None)
             .await
             .unwrap();
 
@@ -303,7 +301,7 @@ mod tests {
         let service = new_analytic_service(db.clone());
 
         let id = db
-            .create_user("testuser".into(), None, false)
+            .create_user("testuser".into(), None, false, None)
             .await
             .unwrap();
 

@@ -65,7 +65,7 @@ export default {
           showReadingTime: true,
           editUrl:
             'https://github.com/TabbyML/tabby/edit/main/website',
-          blogSidebarCount: 10,
+          blogSidebarCount: 20,
         },
         theme: {
           customCss: require.resolve('./src/css/custom.css'),
@@ -169,7 +169,11 @@ export default {
         defaultMode: "light",
         respectPrefersColorScheme: false,
         disableSwitch: true
-      }
+      },
+      tableOfContents: {
+        minHeadingLevel: 2,
+        maxHeadingLevel: 5,
+      },
     }),
 
   plugins: [
@@ -209,7 +213,7 @@ export default {
             from: '/docs/extensions/vscode'
           },
           {
-            to: '/docs/administration/usage-collection',
+            to: '/docs/administration/context',
             from: '/docs/configuration'
           },
           {
@@ -231,7 +235,15 @@ export default {
           {
             to: '/docs/administration/upgrade',
             from: '/docs/administration'
-          }
+          },
+          {
+            to: '/docs/welcome',
+            from: '/docs',
+          },
+          {
+            to: '/docs/quick-start/installation/docker',
+            from: '/docs/quick-start/installation'
+          },
         ],
         createRedirects(existingPath) {
           // Create redirection from /docs/installation/* to /docs/quick-start/installation/*

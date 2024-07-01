@@ -1,11 +1,13 @@
 import React from 'react'
 import { Message } from 'ai'
-import { useChat, type UseChatHelpers } from 'ai/react'
-import { findIndex, omit } from 'lodash-es'
-import type { Context, FileContext } from 'tabby-chat-panel'
+import { findIndex } from 'lodash-es'
+import type { Context } from 'tabby-chat-panel'
 
+import { useDebounceCallback } from '@/lib/hooks/use-debounce'
+import { useLatest } from '@/lib/hooks/use-latest'
 import { filename2prism } from '@/lib/language-utils'
 import {
+  AnswerRequest,
   AssistantMessage,
   MessageActionType,
   QuestionAnswerPair,
@@ -14,11 +16,12 @@ import {
 } from '@/lib/types/chat'
 import { cn, nanoid } from '@/lib/utils'
 
+import { useTabbyAnswer } from '../../lib/hooks/use-tabby-answer'
+import { ListSkeleton } from '../skeleton'
 import { ChatPanel } from './chat-panel'
 import { ChatScrollAnchor } from './chat-scroll-anchor'
 import { EmptyScreen } from './empty-screen'
 import { QuestionAnswerList } from './question-answer'
-import { usePatchFetch } from './use-patch-fetch'
 
 type ChatContextValue = {
   isLoading: boolean
@@ -30,6 +33,9 @@ type ChatContextValue = {
   onNavigateToContext?: (context: Context) => void
   onClearMessages: () => void
   container?: HTMLDivElement
+  onCopyContent?: (value: string) => void
+  isReferenceClickable: boolean
+  from?: string
 }
 
 export const ChatContext = React.createContext<ChatContextValue>(
@@ -39,10 +45,18 @@ export const ChatContext = React.createContext<ChatContextValue>(
 function toMessages(qaPairs: QuestionAnswerPair[] | undefined): Message[] {
   if (!qaPairs?.length) return []
   let result: Message[] = []
-  for (let pair of qaPairs) {
+
+  const len = qaPairs.length
+  for (let i = 0; i < qaPairs.length; i++) {
+    const pair = qaPairs[i]
     let { user, assistant } = pair
     if (user) {
-      result.push(userMessageToMessage(user))
+      result.push(
+        userMessageToMessage(user, {
+          // if it's not the latest user prompt, the message should include the fileContext converted into a code block.
+          includeTransformedSelectContext: len > 1 && i !== len - 1
+        })
+      )
     }
     if (assistant) {
       result.push({
@@ -55,28 +69,39 @@ function toMessages(qaPairs: QuestionAnswerPair[] | undefined): Message[] {
   return result
 }
 
-function userMessageToMessage(userMessage: UserMessage): Message {
-  const { selectContext, message, id } = userMessage
+function userMessageToMessage(
+  userMessage: UserMessage,
+  {
+    includeTransformedSelectContext
+  }: {
+    includeTransformedSelectContext?: boolean
+  }
+): Message {
+  const { message, id } = userMessage
   return {
     id,
     role: 'user',
-    content: message + fileContextToMessageContent(selectContext)
+    content: includeTransformedSelectContext
+      ? message + selectContextToMessageContent(userMessage.selectContext)
+      : message
   }
 }
 
-function fileContextToMessageContent(context: FileContext | undefined): string {
+function selectContextToMessageContent(
+  context: UserMessage['selectContext']
+): string {
   if (!context || !context.content) return ''
   const { content, filepath } = context
   const language = filename2prism(filepath)?.[0]
-  return `\n${'```'}${language ?? ''} is_reference=1\n ${
-    content ?? ''
-  } \n${'```'}\n`
+  return `\n${'```'}${language ?? ''}\n${content ?? ''}\n${'```'}\n`
 }
 
-export interface ChatRef extends Omit<UseChatHelpers, 'append' | 'messages'> {
+export interface ChatRef {
   sendUserChat: (
     message: UserMessageWithOptionalId
   ) => Promise<string | null | undefined>
+  stop: () => void
+  isLoading: boolean
 }
 
 interface ChatProps extends React.ComponentProps<'div'> {
@@ -89,6 +114,14 @@ interface ChatProps extends React.ComponentProps<'div'> {
   onThreadUpdates: (messages: QuestionAnswerPair[]) => void
   onNavigateToContext: (context: Context) => void
   container?: HTMLDivElement
+  docQuery?: boolean
+  generateRelevantQuestions?: boolean
+  maxWidth?: string
+  welcomeMessage?: string
+  promptFormClassname?: string
+  onCopyContent?: (value: string) => void
+  isReferenceClickable?: boolean
+  from?: string
 }
 
 function ChatRenderer(
@@ -97,41 +130,33 @@ function ChatRenderer(
     chatId,
     initialMessages,
     headers,
-    api = '/v1/chat/completions',
+    api = '/v1beta/answer',
     onLoaded,
     onThreadUpdates,
     onNavigateToContext,
     container,
-    fetcher
+    fetcher,
+    docQuery,
+    generateRelevantQuestions,
+    maxWidth,
+    welcomeMessage,
+    promptFormClassname,
+    onCopyContent,
+    isReferenceClickable = true,
+    from
   }: ChatProps,
   ref: React.ForwardedRef<ChatRef>
 ) {
-  usePatchFetch({ api, fetcher })
+  const [initialized, setInitialzed] = React.useState(false)
+  const isOnLoadExecuted = React.useRef(false)
   const [qaPairs, setQaPairs] = React.useState(initialMessages ?? [])
-  const loaded = React.useRef(false)
-  const transformedInitialMessages = React.useMemo(() => {
-    return toMessages(initialMessages)
-  }, [])
+  const [input, setInput] = React.useState<string>('')
 
-  const useChatHelpers = useChat({
-    initialMessages: transformedInitialMessages,
-    id: chatId,
+  const { triggerRequest, isLoading, error, answer, stop } = useTabbyAnswer({
+    api,
     headers,
-    body: {
-      id: chatId
-    }
+    fetcher
   })
-
-  const {
-    messages,
-    append,
-    stop,
-    isLoading,
-    input,
-    setInput,
-    setMessages,
-    error
-  } = useChatHelpers
 
   const onDeleteMessage = async (userMessageId: string) => {
     // Stop generating first.
@@ -139,8 +164,6 @@ function ChatRenderer(
 
     const nextQaPairs = qaPairs.filter(o => o.user.id !== userMessageId)
     setQaPairs(nextQaPairs)
-    // setmessage returns by useChatHelpers
-    setMessages(toMessages(nextQaPairs))
   }
 
   const onRegenerateResponse = async (userMessageid: string) => {
@@ -162,10 +185,7 @@ function ChatRenderer(
         }
       ]
       setQaPairs(nextQaPairs)
-      // exclude the last pair
-      setMessages(toMessages(nextQaPairs.slice(0, -1)))
-      // 'append' the userMessage of last pair to trigger chat api
-      return append(userMessageToMessage(qaPair.user))
+      return triggerRequest(generateRequestPayloadFromQaPairs(nextQaPairs))
     }
   }
 
@@ -182,7 +202,6 @@ function ChatRenderer(
 
   const onClearMessages = () => {
     stop()
-    setMessages([])
     setQaPairs([])
   }
 
@@ -203,33 +222,50 @@ function ChatRenderer(
   }
 
   React.useEffect(() => {
-    if (!isLoading || !qaPairs?.length || !messages?.length) return
+    if (!isLoading || !qaPairs?.length || !answer) return
 
     const lastQaPairs = qaPairs[qaPairs.length - 1]
-    const lastMessage = messages[messages.length - 1]
-    const isAssistantMessageStreaming =
-      lastMessage?.role === 'assistant' &&
-      messages[messages.length - 2]?.id === lastQaPairs.user.id
-    if (isAssistantMessageStreaming) {
-      setQaPairs(prev => {
-        const assisatntMessage = prev[prev.length - 1].assistant
-        const nextAssistantMessage: AssistantMessage = {
-          ...assisatntMessage,
-          id: assisatntMessage?.id || lastMessage.id,
-          message: lastMessage.content,
-          error: undefined
+    const lastMessage = answer
+    setQaPairs(prev => {
+      const assisatntMessage = prev[prev.length - 1].assistant
+      const nextAssistantMessage: AssistantMessage = {
+        ...assisatntMessage,
+        id: assisatntMessage?.id || nanoid(),
+        message: lastMessage.answer_delta ?? '',
+        error: undefined,
+        relevant_code: answer?.relevant_code
+      }
+      // merge assistantMessage
+      return [
+        ...prev.slice(0, prev.length - 1),
+        {
+          ...lastQaPairs,
+          assistant: nextAssistantMessage
         }
-        // merge assistantMessage
-        return [
-          ...prev.slice(0, prev.length - 1),
-          {
-            ...lastQaPairs,
-            assistant: nextAssistantMessage
-          }
-        ]
+      ]
+    })
+  }, [answer, isLoading])
+
+  const scrollToBottom = useDebounceCallback(() => {
+    if (container) {
+      container.scrollTo({
+        top: container.scrollHeight,
+        behavior: 'smooth'
+      })
+    } else {
+      window.scrollTo({
+        top: document.body.offsetHeight,
+        behavior: 'smooth'
       })
     }
-  }, [messages, isLoading])
+  }, 100)
+
+  React.useLayoutEffect(() => {
+    // scroll to bottom when a request is sent
+    if (isLoading) {
+      scrollToBottom.run()
+    }
+  }, [isLoading])
 
   React.useEffect(() => {
     if (error && qaPairs?.length) {
@@ -251,25 +287,61 @@ function ChatRenderer(
     }
   }, [error])
 
-  const sendUserChat = (userMessage: UserMessageWithOptionalId) => {
-    // If no id is provided, set a fallback id.
-    const newUserMessage = {
-      ...userMessage,
-      id: userMessage.id ?? nanoid()
-    }
-    setQaPairs(pairs => [
-      ...pairs,
-      {
-        user: newUserMessage,
-        // For placeholder, and it also conveniently handles streaming responses and displays reference context.
-        assistant: {
-          id: nanoid(),
-          message: '',
-          error: undefined
+  const generateRequestPayloadFromQaPairs = (
+    qaPairs: QuestionAnswerPair[]
+  ): AnswerRequest => {
+    const userMessage = qaPairs[qaPairs.length - 1].user
+    const selectContext = userMessage?.selectContext
+    const code_query: AnswerRequest['code_query'] | undefined = selectContext
+      ? {
+          content: selectContext.content ?? '',
+          filepath: selectContext.filepath,
+          language: selectContext.filepath
+            ? filename2prism(selectContext.filepath)[0] || 'text'
+            : 'text',
+          git_url: selectContext?.git_url ?? ''
         }
+      : undefined
+
+    return {
+      messages: toMessages(qaPairs).slice(0, -1),
+      code_query,
+      doc_query: !!docQuery,
+      generate_relevant_questions: !!generateRelevantQuestions
+    }
+  }
+
+  const handleSendUserChat = useLatest(
+    async (userMessage: UserMessageWithOptionalId) => {
+      if (isLoading) return
+
+      // If no id is provided, set a fallback id.
+      const newUserMessage = {
+        ...userMessage,
+        id: userMessage.id ?? nanoid()
       }
-    ])
-    return append(userMessageToMessage(newUserMessage))
+
+      const nextQaPairs = [
+        ...qaPairs,
+        {
+          user: newUserMessage,
+          // For placeholder, and it also conveniently handles streaming responses and displays reference context.
+          assistant: {
+            id: nanoid(),
+            message: '',
+            error: undefined
+          }
+        }
+      ]
+
+      setQaPairs(nextQaPairs)
+
+      return triggerRequest(generateRequestPayloadFromQaPairs(nextQaPairs))
+    }
+  )
+
+  const sendUserChat = async (userMessage: UserMessageWithOptionalId) => {
+    return handleSendUserChat.current?.(userMessage)
   }
 
   const handleSubmit = async (value: string) => {
@@ -279,7 +351,7 @@ function ChatRenderer(
   }
 
   React.useEffect(() => {
-    if (!loaded.current) return
+    if (!isOnLoadExecuted.current) return
     onThreadUpdates(qaPairs)
   }, [qaPairs])
 
@@ -287,49 +359,68 @@ function ChatRenderer(
     ref,
     () => {
       return {
-        ...omit(useChatHelpers, ['append', 'messages']),
-        sendUserChat
+        sendUserChat,
+        stop,
+        isLoading
       }
     },
-    [useChatHelpers]
+    []
   )
 
   React.useEffect(() => {
-    if (loaded?.current) return
+    if (isOnLoadExecuted.current) return
 
-    loaded.current = true
+    isOnLoadExecuted.current = true
     onLoaded?.()
+    setInitialzed(true)
   }, [])
+
+  const chatMaxWidthClass = maxWidth ? `max-w-${maxWidth}` : 'max-w-2xl'
+  if (!initialized)
+    return (
+      <ListSkeleton className={`${chatMaxWidthClass} mx-auto pt-4 md:pt-10`} />
+    )
 
   return (
     <ChatContext.Provider
       value={{
-        isLoading: useChatHelpers.isLoading,
+        isLoading,
         qaPairs,
         onNavigateToContext,
         handleMessageAction,
         onClearMessages,
-        container
+        container,
+        onCopyContent,
+        isReferenceClickable,
+        from
       }}
     >
       <div className="flex justify-center overflow-x-hidden">
-        <div className="w-full max-w-2xl px-4">
+        <div className={`w-full px-4 ${chatMaxWidthClass}`}>
           <div className={cn('pb-[200px] pt-4 md:pt-10', className)}>
             {qaPairs?.length ? (
-              <QuestionAnswerList messages={qaPairs} />
+              <QuestionAnswerList
+                messages={qaPairs}
+                chatMaxWidthClass={chatMaxWidthClass}
+              />
             ) : (
-              <EmptyScreen setInput={useChatHelpers.setInput} />
+              <EmptyScreen
+                setInput={setInput}
+                chatMaxWidthClass={chatMaxWidthClass}
+                welcomeMessage={welcomeMessage}
+              />
             )}
             <ChatScrollAnchor trackVisibility={isLoading} />
           </div>
           <ChatPanel
             onSubmit={handleSubmit}
-            className="fixed inset-x-0 bottom-0 lg:ml-[280px]"
+            className={cn('fixed inset-x-0 bottom-0', promptFormClassname)}
             id={chatId}
             stop={onStop}
             reload={onReload}
             input={input}
             setInput={setInput}
+            chatMaxWidthClass={chatMaxWidthClass}
           />
         </div>
       </div>
